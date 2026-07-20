@@ -126,6 +126,43 @@ suite("reconcile + language-server restart (integration)", () => {
         assert.strictEqual(__test.siblingWorktreeTabs().length, 0, "no sibling tabs remain");
     });
 
+    test("lazy reconcile: with no strays needing remap, performs ZERO tab open/close ops", async () => {
+        // Window state where nothing needs remapping: only an active-worktree
+        // (feature) tab is open — not a sibling stray.
+        const featCpp = path.join(fx.featureRoot, "src", "greeting.cpp");
+        await vscode.window.showTextDocument(vscode.Uri.file(featCpp), { preview: false });
+        await waitUntil(() => isOpen(featCpp));
+
+        let tabOps = 0;
+        const sub = vscode.window.tabGroups.onDidChangeTabs((e) => {
+            tabOps += e.opened.length + e.closed.length;
+        });
+        try {
+            const repos = await __test.loadReposFrom(fx.featureRoot);
+            const remapped = await __test.reconcileOpenTabs(repos);
+            await new Promise((r) => setTimeout(r, 200)); // let any tab events settle
+            assert.strictEqual(remapped, 0, "nothing remapped");
+            assert.strictEqual(tabOps, 0, "reconcile performed zero tab open/close operations");
+            assert.strictEqual(isOpen(featCpp), true, "the active-worktree tab was untouched");
+        } finally {
+            sub.dispose();
+        }
+    });
+
+    test("lazy reconcile: a LOADED (visible) sibling stray is still remapped eagerly", async () => {
+        const mainCpp = path.join(fx.mainRoot, "src", "greeting.cpp");
+        const featCpp = path.join(fx.featureRoot, "src", "greeting.cpp");
+        // showTextDocument loads the doc and makes it visible → the partition
+        // classifies it eager, so it must be remapped now (not left lazy).
+        await vscode.window.showTextDocument(vscode.Uri.file(mainCpp), { preview: false });
+        await waitUntil(() => isOpen(mainCpp));
+
+        const repos = await __test.loadReposFrom(fx.featureRoot);
+        const remapped = await __test.reconcileOpenTabs(repos);
+        assert.strictEqual(remapped, 1, "the loaded/visible stray was remapped eagerly");
+        await waitUntil(() => !isOpen(mainCpp) && isOpen(featCpp));
+    });
+
     test("restartLanguageServers runs each configured, registered command once", async () => {
         await __test.restartLanguageServers();
         assert.strictEqual(lsRestartCount, 1, "the fake LS restart command ran exactly once");

@@ -3,6 +3,7 @@ import {
     focusTarget,
     orderColumnReopens,
     orderReopensByGroup,
+    partitionReopensByLoad,
     planSiblingIntercept,
     planTabRemap,
     relPathUnder,
@@ -250,6 +251,38 @@ describe("orderReopensByGroup (per-group visible-last ordering)", () => {
     it("omits columns that have no reopens", () => {
         const groups = orderReopensByGroup([reopen({ viewColumn: 3 })]);
         expect(groups.map((g) => g.viewColumn)).toEqual([3]);
+    });
+});
+
+describe("partitionReopensByLoad (lazy reconcile on open)", () => {
+    const r = (sourcePath: string): ReopenAction => reopen({ sourcePath, targetPath: "/b/x" });
+
+    it("remaps loaded strays eagerly and leaves unloaded ones", () => {
+        const reopens = [r("/a/loaded.ts"), r("/a/unloaded.ts"), r("/a/visible.ts")];
+        const { eager, lazy } = partitionReopensByLoad(
+            reopens,
+            new Set(["/a/loaded.ts"]), // loaded docs
+            new Set(["/a/visible.ts"]) // group-visible tabs
+        );
+        expect(eager.map((a) => a.sourcePath)).toEqual(["/a/loaded.ts", "/a/visible.ts"]);
+        expect(lazy.map((a) => a.sourcePath)).toEqual(["/a/unloaded.ts"]);
+    });
+
+    it("treats a visible tab as eager even if it's not in the loaded-doc set", () => {
+        const { eager, lazy } = partitionReopensByLoad(
+            [r("/a/vis.ts")],
+            new Set(),
+            new Set(["/a/vis.ts"])
+        );
+        expect(eager).toHaveLength(1);
+        expect(lazy).toHaveLength(0);
+    });
+
+    it("leaves everything lazy when nothing is loaded or visible (fresh window)", () => {
+        const reopens = [r("/a/one.ts"), r("/a/two.ts")];
+        const { eager, lazy } = partitionReopensByLoad(reopens, new Set(), new Set());
+        expect(eager).toEqual([]);
+        expect(lazy).toEqual(reopens);
     });
 });
 

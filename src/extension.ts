@@ -7,6 +7,7 @@ import { PositionCache } from "./positionCache";
 import {
     focusTarget,
     orderReopensByGroup,
+    partitionReopensByLoad,
     planSiblingIntercept,
     planTabRemap,
     relPathUnder,
@@ -301,13 +302,21 @@ function scheduleMixedWorktreeCheck(): void {
     if (mixedCheckTimer) {clearTimeout(mixedCheckTimer);}
     mixedCheckTimer = setTimeout(async () => {
         mixedCheckTimer = undefined;
-        const siblings = siblingWorktreeTabs();
+        // Only LOADED cross-worktree docs can confuse a language server; unloaded
+        // restored strays are inert (never fired didOpen), and under lazy reconcile
+        // they may persist indefinitely — so excluding them avoids a permanent
+        // false alarm. They still get remapped by interception on first reveal.
+        const loaded = loadedDocPaths();
+        const visible = visibleTabPaths();
+        const siblings = siblingWorktreeTabs().filter(
+            (s) => loaded.has(s.path) || visible.has(s.path)
+        );
         if (siblings.length === 0) {
             mixedWarningShown = false;
             return;
         }
         log(
-            `Mixed-worktree tabs detected (${siblings.length}): ` +
+            `Mixed-worktree tabs detected (${siblings.length} loaded): ` +
                 siblings.map((s) => `[${s.label}] ${s.path}`).join(" | ")
         );
         if (mixedWarningShown) {return;}
@@ -328,13 +337,38 @@ function scheduleMixedWorktreeCheck(): void {
     }, 1000);
 }
 
+/** fsPaths of documents currently LOADED (a TextDocument exists) — file scheme. */
+function loadedDocPaths(): Set<string> {
+    return new Set(
+        vscode.workspace.textDocuments
+            .filter((d) => d.uri.scheme === "file")
+            .map((d) => d.uri.fsPath)
+    );
+}
+
+/** fsPaths of each editor group's visible (active) tab — always "loaded". */
+function visibleTabPaths(): Set<string> {
+    const out = new Set<string>();
+    for (const g of vscode.window.tabGroups.all) {
+        const t = g.activeTab;
+        if (t?.input instanceof vscode.TabInputText && t.input.uri.scheme === "file") {
+            out.add(t.input.uri.fsPath);
+        }
+    }
+    return out;
+}
+
 /**
  * On workspace open, VS Code restores editor tabs by absolute path, which can
  * leave tabs pointing at a sibling worktree that isn't the active one (e.g. a
- * tab left over from a previous session). Remap any such tab to the equivalent
- * file in the active worktree so the open editors match what's focused. Unlike a
- * switch, this never closes tabs that have no equivalent — it only remaps the
- * ones it can, so nothing is lost on startup.
+ * tab left over from a previous session). LAZY reconcile: only remap strays whose
+ * document is already LOADED or is a group's visible tab — those are the ones the
+ * language server actually saw and the only ones whose remap is visible. Unloaded
+ * background strays are left untouched (no close, no open, no focus change): they
+ * never reached the LS and look identical to their equivalent, so touching them
+ * is pure flicker. Interception remaps each such stray the moment the user reveals
+ * it (revealing loads the doc → didOpen → interceptor). Never closes tabs with no
+ * equivalent, so nothing is lost on startup.
  */
 async function reconcileOpenTabs(repos: RepoSnapshot[]): Promise<number> {
     const carryTabs = vscode.workspace
@@ -347,21 +381,39 @@ async function reconcileOpenTabs(repos: RepoSnapshot[]): Promise<number> {
     if (!found) {return 0;}
     const { commonDir, siblings } = found;
 
+    const loaded = loadedDocPaths();
+    const visible = visibleTabPaths();
+
     let remapped = 0;
+    let lazyLeft = 0;
     for (const sibling of siblings) {
         try {
             const { plan, tabByKey } = await buildTabRemapPlan(sibling, active, (rel) =>
                 positionCache?.get(commonDir, rel)
             );
             if (plan.reopen.length === 0) {continue;}
+            // Partition: remap only LOADED/visible strays now; leave unloaded ones
+            // for interception on first reveal.
+            const { eager, lazy } = partitionReopensByLoad(plan.reopen, loaded, visible);
+            lazyLeft += lazy.length;
+            if (eager.length === 0) {continue;}
             // Only remap tabs that have an equivalent; leave orphan tabs open.
-            const remapOnly: TabRemapPlan = { reopen: plan.reopen, closeMissing: [], skipDirty: [] };
-            log(`Reconcile on open: ${sibling} → ${active} (remap ${plan.reopen.length} tab(s))`);
+            const remapOnly: TabRemapPlan = { reopen: eager, closeMissing: [], skipDirty: [] };
+            log(
+                `Reconcile on open: ${sibling} → ${active} ` +
+                    `(remap ${eager.length} loaded, leave ${lazy.length} unloaded for lazy intercept)`
+            );
             await applyTabRemap(remapOnly, tabByKey, positionCache ?? undefined);
-            remapped += plan.reopen.length;
+            remapped += eager.length;
         } catch (e) {
             log(`Reconcile failed for ${sibling}: ${e instanceof Error ? e.message : String(e)}`);
         }
+    }
+    if (remapped === 0) {
+        log(
+            `Reconcile on open: nothing to do` +
+                (lazyLeft > 0 ? ` (${lazyLeft} unloaded stray(s) left for lazy intercept)` : "")
+        );
     }
     return remapped;
 }
@@ -921,8 +973,10 @@ export function activate(context: vscode.ExtensionContext) {
  *   2. From authoritative git discovery, which re-drives reconcile (idempotent —
  *      normally 0 strays), refreshes the view, and persists a fresh snapshot.
  * Reconcile is idempotent, so a stale snapshot converges once discovery corrects
- * it. Interception stays off (startup grace) until this completes, so restored
- * tabs get one batched reconcile instead of N racing per-tab intercepts.
+ * it. Interception stays off (startup grace) only until pass 1's lazy partition
+ * is done — flipped right after so a user click on an unloaded restored stray
+ * (which loads it → didOpen) is intercepted immediately, without waiting on the
+ * discovery pass.
  */
 async function runStartupReconcile(primed: RepoSnapshot[]): Promise<void> {
     try {
@@ -939,6 +993,9 @@ async function runStartupReconcile(primed: RepoSnapshot[]): Promise<void> {
                 scheduleLanguageServerRestart();
             }
         }
+        // Lazy reconcile leaves unloaded strays in place, so arm interception now
+        // (right after the partition) to catch the first reveal of any of them.
+        markStartupReconcileDone();
 
         // Pass 2 — authoritative discovery re-drives the reconcile.
         const repos = await getRepos();
@@ -1089,10 +1146,15 @@ export async function buildTabRemapPlan(
         })
     );
 
-    log(
-        `buildTabRemapPlan: ${snapshots.length} text tab(s); ${targets.size} under oldRoot; ` +
-            `${existing.size} exist in newRoot. sample=${snapshots.slice(0, 3).map((s) => s.path).join(", ")}`
-    );
+    // Only log when there is actually something under oldRoot to consider; an
+    // empty plan (the common re-plan/confirm case) is silent to avoid open-path
+    // log spam (log5.txt L41–50).
+    if (targets.size > 0) {
+        log(
+            `buildTabRemapPlan: ${snapshots.length} text tab(s); ${targets.size} under oldRoot; ` +
+                `${existing.size} exist in newRoot. sample=${snapshots.slice(0, 3).map((s) => s.path).join(", ")}`
+        );
+    }
 
     const plan = planTabRemap({
         tabs: snapshots,

@@ -240,6 +240,36 @@ export function orderColumnReopens(actions: ReopenAction[]): ReopenAction[] {
     return [...actions].sort((a, b) => a.tabIndex - b.tabIndex);
 }
 
+/**
+ * Partition reopen actions into eager (remap now) vs lazy (leave for
+ * interception) for the WINDOW-OPEN path. Rationale: VS Code restores background
+ * tabs UNLOADED — no TextDocument exists until the tab is first revealed — so an
+ * unloaded sibling-worktree stray (a) never reached the language server (it never
+ * fired didOpen, so nothing to re-scope) and (b) shows a label identical to its
+ * remapped equivalent. Touching it eagerly is pure visible churn with zero LS
+ * benefit. So only strays whose source doc is already LOADED, or that are their
+ * group's visible tab, are remapped now; the rest are left untouched and get
+ * remapped by interception the moment the user reveals them (revealing loads the
+ * doc → didOpen → interceptor). `loadedPaths` = fsPaths in
+ * workspace.textDocuments; `visiblePaths` = each group's active tab.
+ */
+export function partitionReopensByLoad(
+    reopens: ReopenAction[],
+    loadedPaths: ReadonlySet<string>,
+    visiblePaths: ReadonlySet<string>
+): { eager: ReopenAction[]; lazy: ReopenAction[] } {
+    const eager: ReopenAction[] = [];
+    const lazy: ReopenAction[] = [];
+    for (const a of reopens) {
+        if (loadedPaths.has(a.sourcePath) || visiblePaths.has(a.sourcePath)) {
+            eager.push(a);
+        } else {
+            lazy.push(a);
+        }
+    }
+    return { eager, lazy };
+}
+
 export type GroupReopenOrder = {
     viewColumn: number;
     /** Reopens for this column, non-visible first (by tabIndex), then the
