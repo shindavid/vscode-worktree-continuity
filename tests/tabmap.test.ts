@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
     orderColumnReopens,
+    planSiblingIntercept,
     planTabRemap,
     relPathUnder,
     targetPathFor,
@@ -192,5 +193,61 @@ describe("orderColumnReopens", () => {
             action({ relPath: "first.ts", tabIndex: 0 }),
         ]);
         expect(ordered.map((a) => a.relPath)).toEqual(["first.ts", "active.ts", "third.ts"]);
+    });
+});
+
+describe("planSiblingIntercept", () => {
+    const ACTIVE = "/repo/feature";
+    const SIBLING = "/repo/main";
+
+    it("remaps a file opened under a sibling worktree to the active equivalent", () => {
+        const plan = planSiblingIntercept(
+            "/repo/main/src/greeting.cpp",
+            ACTIVE,
+            SIBLING
+        );
+        expect(plan).toEqual({
+            intercept: true,
+            targetPath: "/repo/feature/src/greeting.cpp",
+            relPath: "src/greeting.cpp",
+        });
+    });
+
+    it("does not intercept a file already inside the active worktree", () => {
+        const plan = planSiblingIntercept("/repo/feature/src/x.cpp", ACTIVE, ACTIVE);
+        expect(plan).toEqual({ intercept: false, reason: "already in active worktree" });
+    });
+
+    it("does not intercept when there is no active worktree", () => {
+        const plan = planSiblingIntercept("/repo/main/src/x.cpp", null, SIBLING);
+        expect(plan.intercept).toBe(false);
+    });
+
+    it("does not intercept a file outside any known worktree", () => {
+        const plan = planSiblingIntercept("/elsewhere/x.cpp", ACTIVE, null);
+        expect(plan).toEqual({ intercept: false, reason: "not under a known worktree" });
+    });
+
+    it("does not intercept when the containing worktree IS the active one", () => {
+        const plan = planSiblingIntercept("/repo/feature/x.cpp", ACTIVE, ACTIVE);
+        expect(plan.intercept).toBe(false);
+    });
+
+    it("preserves nested relative paths in the remap target", () => {
+        const plan = planSiblingIntercept("/repo/main/a/b/c/deep.cpp", ACTIVE, SIBLING);
+        expect(plan).toEqual({
+            intercept: true,
+            targetPath: "/repo/feature/a/b/c/deep.cpp",
+            relPath: "a/b/c/deep.cpp",
+        });
+    });
+
+    it("uses the injected same-root comparator to reject the active worktree", () => {
+        // containingWorktree differs only by a trailing slash from active; a
+        // slash-tolerant comparator must still treat it as the active worktree.
+        const sameRoot = (a: string, b: string): boolean =>
+            a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+        const plan = planSiblingIntercept("/other/x.cpp", ACTIVE, ACTIVE + "/", sameRoot);
+        expect(plan).toEqual({ intercept: false, reason: "same as active worktree" });
     });
 });

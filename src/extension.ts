@@ -5,6 +5,7 @@ import { getGitCommonDir, getSuperprojectPath, listWorktrees, type Worktree } fr
 import { PositionCache } from "./positionCache";
 import {
     orderColumnReopens,
+    planSiblingIntercept,
     planTabRemap,
     relPathUnder,
     targetPathFor,
@@ -128,6 +129,16 @@ let mixedCheckTimer: ReturnType<typeof setTimeout> | undefined;
 // attributed to the extension itself rather than to the user or a language
 // server. A counter (not a bool) because reconcile applies remaps in sequence.
 let applyRemapDepth = 0;
+
+// Feature 1: intercept a sibling-worktree file being opened (typically a
+// Go-to-Definition landing in the wrong worktree) and immediately remap it to
+// the active worktree's equivalent, before the stray tab can re-contaminate a
+// freshly re-scoped language server. Enabled by default; suites that need stray
+// tabs to persist turn it off via __test.setInterceptionEnabled.
+let interceptSiblingOpens = true;
+// URIs currently being remapped, so the target-open / stray-close churn we
+// generate doesn't re-enter interception.
+const inFlightIntercepts = new Set<string>();
 
 /** The discovered non-bare worktree that contains `fsPath` (longest match), if any. */
 function worktreeOfPath(fsPath: string): { commonDir: string; path: string; label: string } | null {
@@ -318,31 +329,316 @@ async function reconcileOpenTabs(repos: RepoSnapshot[]): Promise<number> {
     return remapped;
 }
 
-let lsRestartTimer: ReturnType<typeof setTimeout> | undefined;
-let lastLsRestartAt = 0;
+/** The open text tab (and its column) for a uri, if any. */
+function findTextTab(uri: vscode.Uri): { tab: vscode.Tab; viewColumn: number } | null {
+    const uriStr = uri.toString();
+    for (const group of vscode.window.tabGroups.all) {
+        for (const t of group.tabs) {
+            if (t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr) {
+                return { tab: t, viewColumn: group.viewColumn };
+            }
+        }
+    }
+    return null;
+}
+
+/** Whether a uri is currently shown inside a diff editor (never intercept those). */
+function hasDiffTabFor(uri: vscode.Uri): boolean {
+    const uriStr = uri.toString();
+    for (const group of vscode.window.tabGroups.all) {
+        for (const t of group.tabs) {
+            if (
+                t.input instanceof vscode.TabInputTextDiff &&
+                (t.input.original.toString() === uriStr || t.input.modified.toString() === uriStr)
+            ) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/** Bounded wait for a visible editor on `uri` to materialize (go-to-def target). */
+function waitForVisibleEditor(
+    uri: vscode.Uri,
+    timeoutMs: number
+): Promise<vscode.TextEditor | undefined> {
+    const uriStr = uri.toString();
+    const find = (): vscode.TextEditor | undefined =>
+        vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === uriStr);
+    const existing = find();
+    if (existing) {return Promise.resolve(existing);}
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = (ed: vscode.TextEditor | undefined): void => {
+            if (done) {return;}
+            done = true;
+            clearTimeout(timer);
+            clearInterval(poll);
+            sub.dispose();
+            resolve(ed);
+        };
+        const sub = vscode.window.onDidChangeActiveTextEditor(() => {
+            const f = find();
+            if (f) {finish(f);}
+        });
+        const poll = setInterval(() => {
+            const f = find();
+            if (f) {finish(f);}
+        }, 25);
+        const timer = setTimeout(() => finish(find()), timeoutMs);
+    });
+}
+
+function positionFromEditor(editor: vscode.TextEditor): CachedPosition {
+    const s = editor.selection;
+    const cp: CachedPosition = {
+        selection: {
+            anchorLine: s.anchor.line,
+            anchorChar: s.anchor.character,
+            activeLine: s.active.line,
+            activeChar: s.active.character,
+        },
+    };
+    const top = editor.visibleRanges[0]?.start.line;
+    if (top !== undefined) {cp.topLine = top;}
+    return cp;
+}
+
+/**
+ * When a file from a sibling worktree is opened (e.g. Go-to-Definition resolving
+ * into the wrong worktree), immediately remap it to the active worktree's
+ * equivalent at the same cursor position — showing the correct editor first,
+ * then closing the stray tab — so a shared language server can't be
+ * re-contaminated. This is the live-case replacement for the slower
+ * reconcile-on-detection loop; periodic reconcile stays as a backstop.
+ */
+async function interceptSiblingOpen(doc: vscode.TextDocument): Promise<void> {
+    if (!interceptSiblingOpens) {return;}
+    if (doc.uri.scheme !== "file") {return;}
+    const carryTabs = vscode.workspace
+        .getConfiguration()
+        .get<boolean>("worktree-continuity.carryTabs", true);
+    if (!carryTabs) {return;}
+    const active = activeWorktreePath;
+    if (!active) {return;}
+    const uriStr = doc.uri.toString();
+    if (inFlightIntercepts.has(uriStr)) {return;}
+    // Never close a dirty document (its edits may only exist here).
+    if (doc.isDirty) {return;}
+    const p = doc.uri.fsPath;
+    const wt = worktreeOfPath(p);
+    const plan = planSiblingIntercept(p, active, wt?.path ?? null, samePath);
+    if (!plan.intercept) {return;}
+    const target = plan.targetPath;
+    const rel = plan.relPath;
+    if (!(await pathExists(target))) {return;}
+
+    inFlightIntercepts.add(uriStr);
+    try {
+        // Position fidelity: wait briefly for the stray editor so we can read the
+        // exact go-to-def selection; fall back to the position cache otherwise.
+        const editor = await waitForVisibleEditor(doc.uri, 150);
+        if (hasDiffTabFor(doc.uri)) {
+            log(`Intercept skipped (diff editor): ${p}`);
+            return;
+        }
+        const stray = findTextTab(doc.uri);
+        if (!stray) {return;} // no tab to remap (never painted, or already gone)
+        const viewColumn = editor?.viewColumn ?? stray.viewColumn;
+
+        let position: CachedPosition | undefined;
+        if (editor) {
+            position = positionFromEditor(editor);
+        } else {
+            const key = resolveCacheKey(target);
+            position = key ? positionCache?.get(key.commonDir, key.relPath) : undefined;
+        }
+        const sel = position?.selection;
+        const line = sel ? sel.activeLine : 0;
+        const character = sel ? sel.activeChar : 0;
+
+        const action: ReopenAction = {
+            sourcePath: p,
+            targetPath: target,
+            relPath: rel,
+            viewColumn,
+            tabIndex: 0,
+            makeActiveInGroup: true,
+            focusGlobally: true,
+            position,
+        };
+
+        applyRemapDepth++;
+        positionCache?.suspend();
+        try {
+            // Show the correct editor FIRST (minimizes perceived flash), then close
+            // the stray tab.
+            await openReopenAction(action, false);
+            await vscode.window.tabGroups.close(stray.tab, true);
+        } finally {
+            positionCache?.resume();
+            applyRemapDepth--;
+        }
+        log(`Intercepted sibling open: ${p} → ${target} @${line}:${character}`);
+    } catch (e) {
+        log(`Intercept failed for ${p}: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+        inFlightIntercepts.delete(uriStr);
+    }
+}
 
 // Fire quickly after a switch (small window where the language server still has
-// the old worktree's index), but never within MIN_GAP of a previous restart —
-// restarting while a language server is still starting up double-registers its
-// commands and errors ("command 'clangd.applyFix' already exists").
+// the old worktree's index). Rather than a fixed minimum gap between restarts —
+// which either wastes time or races an in-flight startup — we gate the next
+// restart on an OBSERVED readiness signal: a restart is "in flight" from the
+// moment its commands are issued until the server reports Running again (or we
+// give up). Restarting while a server is still starting double-registers its
+// commands and errors ("command 'clangd.applyFix' already exists"), so a trigger
+// that arrives mid-flight is coalesced into a single follow-up restart.
 const LS_RESTART_DEBOUNCE_MS = 400;
-const LS_RESTART_MIN_GAP_MS = 4000;
+// Cap on how long we wait for the readiness signal before treating the restart
+// as settled anyway.
+const LS_READY_TIMEOUT_MS = 15_000;
+// When readiness is unobservable (the language-server extension/API isn't
+// present), fall back to a fixed time gap. Measured clangd stop→start is ~5s.
+const LS_UNOBSERVABLE_GAP_MS = 6_000;
+
+/** clangd's language client can be in one of these states (vscode-languageclient). */
+const LS_STATE_RUNNING = 2; // State.Running
+
+type LsReadiness = "ready" | "timeout" | "unobservable";
+
+let lsRestartTimer: ReturnType<typeof setTimeout> | undefined;
+// True from when a restart's commands are issued until its readiness resolves.
+let lsRestartInFlight = false;
+// A trigger that arrived while a restart was in flight; runs exactly one more
+// restart once the current one settles.
+let lsRestartPending = false;
+// Generation token so a reset (test isolation) makes any in-flight cycle abort
+// instead of acting on stale state.
+let lsRestartGen = 0;
+let lsUnobservableTimer: ReturnType<typeof setTimeout> | undefined;
+let lsUnobservableResolve: (() => void) | undefined;
+
+/**
+ * Readiness probe. Resolves 'ready' when the language server is Running again,
+ * 'timeout' if it doesn't within the budget, or 'unobservable' if there's no API
+ * to observe. Injectable via __test so integration tests can fake it (the
+ * clangd extension isn't installed in the test host).
+ */
+let lsReadyProbe: (timeoutMs: number) => Promise<LsReadiness> = clangdWaitForLsReady;
+
+function waitForLsReady(timeoutMs: number): Promise<LsReadiness> {
+    return lsReadyProbe(timeoutMs);
+}
+
+/**
+ * clangd-specific readiness probe. `extensions.getExtension(id)?.exports` exposes
+ * `getApi(1) -> { languageClient }`, where languageClient is a vscode-languageclient
+ * `LanguageClient` with `.state` (State.Running === 2) and `.onDidChangeState`.
+ * Resolves 'ready' on Running, 'timeout' after timeoutMs, 'unobservable' if the
+ * extension or API is absent.
+ */
+async function clangdWaitForLsReady(timeoutMs: number): Promise<LsReadiness> {
+    try {
+        const ext = vscode.extensions.getExtension("llvm-vs-code-extensions.vscode-clangd");
+        if (!ext) {return "unobservable";}
+        const exports = ext.isActive ? ext.exports : await ext.activate();
+        const client = exports?.getApi?.(1)?.languageClient as
+            | {
+                  state?: number;
+                  onDidChangeState?: (l: (e: { newState?: number }) => void) => vscode.Disposable;
+              }
+            | undefined;
+        if (!client) {return "unobservable";}
+        const isRunning = (): boolean => client.state === LS_STATE_RUNNING;
+        if (isRunning()) {return "ready";}
+        return await new Promise<LsReadiness>((resolve) => {
+            let done = false;
+            let sub: vscode.Disposable | undefined;
+            const finish = (v: LsReadiness): void => {
+                if (done) {return;}
+                done = true;
+                clearTimeout(timer);
+                sub?.dispose();
+                resolve(v);
+            };
+            if (typeof client.onDidChangeState === "function") {
+                sub = client.onDidChangeState((e) => {
+                    if ((e?.newState ?? client.state) === LS_STATE_RUNNING) {finish("ready");}
+                });
+            } else {
+                const poll = setInterval(() => {
+                    if (isRunning()) {finish("ready");}
+                }, 250);
+                sub = { dispose: () => clearInterval(poll) };
+            }
+            const timer = setTimeout(() => finish("timeout"), timeoutMs);
+        });
+    } catch (e) {
+        log(`LS readiness probe failed: ${e instanceof Error ? e.message : String(e)}`);
+        return "unobservable";
+    }
+}
+
+function delayUnobservableGap(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+        lsUnobservableResolve = resolve;
+        lsUnobservableTimer = setTimeout(() => {
+            lsUnobservableTimer = undefined;
+            lsUnobservableResolve = undefined;
+            resolve();
+        }, ms);
+    });
+}
 
 /**
  * Schedule a debounced language-server re-scope. Many servers (clangd included)
  * keep the previous worktree's index across a folder swap, so after a switch we
- * restart them to force a clean re-scope. Rapid triggers coalesce into one, and
- * a minimum gap keeps a restart from racing an in-flight startup.
+ * restart them to force a clean re-scope. Rapid triggers within the debounce
+ * window coalesce into one; a trigger that arrives while a restart is still in
+ * flight sets a pending flag so exactly one follow-up restart runs once the
+ * current one is ready.
  */
 function scheduleLanguageServerRestart(): void {
+    if (lsRestartInFlight) {
+        lsRestartPending = true;
+        return;
+    }
     if (lsRestartTimer) {clearTimeout(lsRestartTimer);}
-    const sinceLast = Date.now() - lastLsRestartAt;
-    const delay = Math.max(LS_RESTART_DEBOUNCE_MS, LS_RESTART_MIN_GAP_MS - sinceLast);
     lsRestartTimer = setTimeout(() => {
         lsRestartTimer = undefined;
-        lastLsRestartAt = Date.now();
-        void restartLanguageServers();
-    }, delay);
+        void runLanguageServerRestartCycle();
+    }, LS_RESTART_DEBOUNCE_MS);
+}
+
+/**
+ * Issue a restart, then hold "in flight" until the server is observed ready (or
+ * the budget elapses, or readiness is unobservable → fixed gap). If a trigger
+ * arrived meanwhile, run exactly one more cycle.
+ */
+async function runLanguageServerRestartCycle(): Promise<void> {
+    const gen = lsRestartGen;
+    lsRestartInFlight = true;
+    lsRestartPending = false;
+    try {
+        await restartLanguageServers();
+    } catch (e) {
+        log(`LS restart cycle error: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    const readiness = await waitForLsReady(LS_READY_TIMEOUT_MS);
+    if (gen !== lsRestartGen) {return;} // reset during the wait; abort
+    log(`LS restart: readiness = ${readiness}`);
+    if (readiness === "unobservable") {
+        await delayUnobservableGap(LS_UNOBSERVABLE_GAP_MS);
+        if (gen !== lsRestartGen) {return;}
+    }
+    lsRestartInFlight = false;
+    if (lsRestartPending) {
+        lsRestartPending = false;
+        await runLanguageServerRestartCycle();
+    }
 }
 
 /**
@@ -530,6 +826,12 @@ export function activate(context: vscode.ExtensionContext) {
         }),
         vscode.window.onDidChangeTextEditorVisibleRanges((e) => {
             recordEditorTopLine(e.textEditor);
+        }),
+        // Feature 1: intercept a sibling-worktree open (e.g. Go-to-Definition
+        // landing in the wrong worktree) at the earliest pre-paint signal and
+        // remap it to the active worktree, before it re-contaminates the server.
+        vscode.workspace.onDidOpenTextDocument((doc) => {
+            void interceptSiblingOpen(doc);
         }),
         // Warn (with a one-click fix) if tabs from another worktree get opened,
         // which can make a shared language server resolve symbols to the wrong copy.
@@ -1264,6 +1566,7 @@ export const __test = {
     reconcileOpenTabs,
     restartLanguageServers,
     scheduleLanguageServerRestart,
+    interceptSiblingOpen,
     siblingWorktreeTabs,
     deriveActiveWorktree,
     getActiveWorktree(): string | null {
@@ -1279,11 +1582,30 @@ export const __test = {
         return lastKnownRepos;
     },
     resetLsRestartState(): void {
+        lsRestartGen++;
         if (lsRestartTimer) {
             clearTimeout(lsRestartTimer);
             lsRestartTimer = undefined;
         }
-        lastLsRestartAt = 0;
+        if (lsUnobservableTimer) {
+            clearTimeout(lsUnobservableTimer);
+            lsUnobservableTimer = undefined;
+        }
+        if (lsUnobservableResolve) {
+            const r = lsUnobservableResolve;
+            lsUnobservableResolve = undefined;
+            r();
+        }
+        lsRestartInFlight = false;
+        lsRestartPending = false;
+    },
+    /** Inject a fake readiness probe; pass undefined to restore the real one. */
+    setLsReadinessProbe(fn: ((timeoutMs: number) => Promise<LsReadiness>) | undefined): void {
+        lsReadyProbe = fn ?? clangdWaitForLsReady;
+    },
+    /** Toggle sibling-open interception (suites that need strays to persist turn it off). */
+    setInterceptionEnabled(enabled: boolean): void {
+        interceptSiblingOpens = enabled;
     },
 };
 

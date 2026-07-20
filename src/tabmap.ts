@@ -97,6 +97,44 @@ export function targetPathFor(oldRoot: string, newRoot: string, tabPath: string)
     return path.join(newRoot, rel);
 }
 
+export type SiblingInterceptPlan =
+    | { intercept: false; reason: string }
+    | { intercept: true; targetPath: string; relPath: string };
+
+/**
+ * Pure geometry for sibling-open interception (Feature 1): given the opened
+ * file, the active worktree root, and the sibling worktree root that contains
+ * the file (from the caller's longest-match lookup, or null), decide whether to
+ * remap the open to the active worktree and to which equivalent path. The
+ * non-geometry gates — scheme, dirtiness, config, in-flight de-dup, and whether
+ * the target actually exists — are the caller's responsibility.
+ */
+export function planSiblingIntercept(
+    docPath: string,
+    activeRoot: string | null,
+    containingWorktree: string | null,
+    isSameRoot: (a: string, b: string) => boolean = (a, b) => a === b
+): SiblingInterceptPlan {
+    if (!activeRoot) {
+        return { intercept: false, reason: "no active worktree" };
+    }
+    if (relPathUnder(activeRoot, docPath) !== null) {
+        return { intercept: false, reason: "already in active worktree" };
+    }
+    if (!containingWorktree) {
+        return { intercept: false, reason: "not under a known worktree" };
+    }
+    if (isSameRoot(containingWorktree, activeRoot)) {
+        return { intercept: false, reason: "same as active worktree" };
+    }
+    const relPath = relPathUnder(containingWorktree, docPath);
+    const targetPath = targetPathFor(containingWorktree, activeRoot, docPath);
+    if (relPath === null || targetPath === null) {
+        return { intercept: false, reason: "not inside sibling worktree" };
+    }
+    return { intercept: true, targetPath, relPath };
+}
+
 export type PlanInput = {
     tabs: TabSnapshot[];
     oldRoot: string;

@@ -18,15 +18,24 @@ other worktree, that reinforces the confusion.
 
 **How Worktree Continuity avoids it:** it keeps a single worktree's files open at
 a time — carrying tabs to the active worktree on switch, reconciling stray tabs
-on window open, and restarting the language server so it re-scopes to the active
-worktree. The one case it can't prevent automatically is when you **manually**
-open a file from another worktree mid-session.
+on window open, and **intercepting a sibling-worktree file the moment it opens**
+(e.g. a Go to Definition that resolves into another worktree): it remaps the open
+to the active worktree's equivalent at the same cursor position and closes the
+stray tab, before a shared language server can latch onto the other worktree.
+After a switch or remap it restarts the language server so it re-scopes cleanly,
+and it waits for the server to report ready before allowing another restart (so
+a rapid sequence of switches can't leave a restart racing a half-started server).
 
-**How to fix it:** click **Reconcile** on the warning — it remaps the stray tabs
-to the active worktree and restarts the language server. Or run
-**Worktree Continuity: Switch Worktree** to any worktree and back, which closes
-other-worktree files as part of the switch. Manually, you can close the
-other-worktree tab(s) and then run **clangd: Restart language server**.
+The one case interception can't silently handle is a file that exists **only** in
+the other worktree (no equivalent to remap to) — then the tab is left open and
+the one-click warning below appears.
+
+**How to fix it:** interception handles the common case automatically. If the
+warning does appear, click **Reconcile** — it remaps the stray tabs to the active
+worktree and restarts the language server. Or run **Worktree Continuity: Switch
+Worktree** to any worktree and back, which closes other-worktree files as part of
+the switch. Manually, you can close the other-worktree tab(s) and then run
+**clangd: Restart language server**.
 
 **How to avoid it:** don't open files from a non-active worktree directly. Switch
 to that worktree instead (the Worktrees view, or the switch command).

@@ -36,6 +36,10 @@ suite("reconcile + language-server restart (integration)", () => {
 
     suiteSetup(async () => {
         fx = makeWorktreeFixture();
+        // This suite deliberately opens sibling-worktree tabs and expects them to
+        // persist; Feature 1 interception would remap them away, so turn it off
+        // here (the dedicated interception suite turns it back on).
+        __test.setInterceptionEnabled(false);
         cmdReg = vscode.commands.registerCommand(LS_CMD, () => {
             lsRestartCount++;
         });
@@ -49,6 +53,7 @@ suite("reconcile + language-server restart (integration)", () => {
     });
 
     suiteTeardown(async () => {
+        __test.setInterceptionEnabled(true);
         cmdReg.dispose();
         await vscode.workspace
             .getConfiguration()
@@ -112,5 +117,47 @@ suite("reconcile + language-server restart (integration)", () => {
         await waitUntil(() => lsRestartCount >= 1, 8000);
         await new Promise((r) => setTimeout(r, 1500));
         assert.strictEqual(lsRestartCount, 1, "debounce + min-gap collapse the burst to one restart");
+    });
+
+    test("readiness gate: a trigger during an in-flight restart fires exactly one follow-up", async () => {
+        // Fake readiness probe we resolve by hand, so the restart stays "in
+        // flight" until we say the server is ready.
+        let probeCalls = 0;
+        let resolveReady: ((v: "ready" | "timeout" | "unobservable") => void) | undefined;
+        __test.setLsReadinessProbe(
+            () =>
+                new Promise((r) => {
+                    probeCalls++;
+                    resolveReady = r;
+                })
+        );
+        try {
+            __test.resetLsRestartState();
+            lsRestartCount = 0;
+
+            // First trigger → after debounce, one restart runs, then blocks on
+            // readiness (held unresolved).
+            __test.scheduleLanguageServerRestart();
+            await waitUntil(() => lsRestartCount === 1, 4000);
+            await waitUntil(() => probeCalls === 1, 2000);
+
+            // A trigger while in flight must NOT run another restart yet.
+            __test.scheduleLanguageServerRestart();
+            await new Promise((r) => setTimeout(r, 800));
+            assert.strictEqual(lsRestartCount, 1, "no extra restart while readiness is unresolved");
+
+            // Readiness resolves → the pending trigger runs exactly one more restart.
+            resolveReady!("ready");
+            await waitUntil(() => lsRestartCount === 2, 4000);
+            await waitUntil(() => probeCalls === 2, 2000);
+
+            // Let the second cycle settle; assert it did not spawn a third.
+            resolveReady!("ready");
+            await new Promise((r) => setTimeout(r, 800));
+            assert.strictEqual(lsRestartCount, 2, "pending restart fired exactly once");
+        } finally {
+            __test.setLsReadinessProbe(undefined);
+            __test.resetLsRestartState();
+        }
     });
 });
