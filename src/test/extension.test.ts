@@ -58,6 +58,8 @@ suite("tab carry (integration)", () => {
         for (const root of [aRoot, bRoot]) {
             fs.mkdirSync(path.join(root, "src"), { recursive: true });
             fs.writeFileSync(path.join(root, "src", "foo.ts"), FILE_BODY);
+            fs.writeFileSync(path.join(root, "src", "bar.ts"), FILE_BODY);
+            fs.writeFileSync(path.join(root, "src", "baz.ts"), FILE_BODY);
         }
         // A file that only exists in A (no equivalent in B).
         fs.writeFileSync(path.join(aRoot, "src", "only-in-a.ts"), FILE_BODY);
@@ -125,6 +127,35 @@ suite("tab carry (integration)", () => {
         }
         await waitUntil(() => !isOpen(aFoo));
         assert.strictEqual(isOpen(aFoo), false, "old-worktree tab should be closed");
+    });
+
+    test("batched remap of multiple tabs leaves the previously-active stray's equivalent focused", async () => {
+        const aFoo = path.join(aRoot, "src", "foo.ts");
+        const aBar = path.join(aRoot, "src", "bar.ts");
+        const aBaz = path.join(aRoot, "src", "baz.ts");
+        const bBar = path.join(bRoot, "src", "bar.ts");
+        // Open three A tabs; make the MIDDLE one (bar.ts) the active one.
+        await vscode.window.showTextDocument(vscode.Uri.file(aFoo), { preview: false });
+        await vscode.window.showTextDocument(vscode.Uri.file(aBaz), { preview: false });
+        await vscode.window.showTextDocument(vscode.Uri.file(aBar), { preview: false });
+        await waitUntil(() => isOpen(aFoo) && isOpen(aBar) && isOpen(aBaz));
+        await waitUntil(() => vscode.window.activeTextEditor?.document.uri.fsPath === aBar);
+
+        const { plan, tabByKey } = await buildTabRemapPlan(aRoot, bRoot, () => undefined);
+        await applyTabRemap(plan, tabByKey);
+
+        // Single-focus outcome: the equivalent of the previously-active stray is
+        // the final active editor, and all three A tabs are gone.
+        await waitUntil(() => vscode.window.activeTextEditor?.document.uri.fsPath === bBar);
+        assert.strictEqual(
+            vscode.window.activeTextEditor!.document.uri.fsPath,
+            bBar,
+            "equivalent of the previously-active stray (bar.ts) is focused"
+        );
+        await waitUntil(() => !isOpen(aFoo) && !isOpen(aBar) && !isOpen(aBaz));
+        assert.strictEqual(isOpen(aFoo), false, "stray foo.ts closed");
+        assert.strictEqual(isOpen(aBar), false, "stray bar.ts closed");
+        assert.strictEqual(isOpen(aBaz), false, "stray baz.ts closed");
     });
 
     test("closes a tab whose file has no equivalent in the new worktree", async () => {

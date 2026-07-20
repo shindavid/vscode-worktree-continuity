@@ -112,6 +112,10 @@ export interface InterceptGate {
     /** This URI is already being remapped (dedupes the didOpen + tab triggers). */
     alreadyInFlight: boolean;
     isDirty: boolean;
+    /** False during the startup grace window, before the initial reconcile-on-open
+     * has run once — restored sibling tabs get one batched reconcile instead of N
+     * racing per-tab intercepts. */
+    startupGracePassed: boolean;
 }
 
 /**
@@ -124,6 +128,7 @@ export interface InterceptGate {
 export function shouldConsiderIntercept(g: InterceptGate): boolean {
     return (
         g.enabled &&
+        g.startupGracePassed &&
         !g.switchInProgress &&
         !g.extensionDrivenOpen &&
         g.scheme === "file" &&
@@ -233,4 +238,26 @@ export function planTabRemap(input: PlanInput): TabRemapPlan {
  */
 export function orderColumnReopens(actions: ReopenAction[]): ReopenAction[] {
     return [...actions].sort((a, b) => a.tabIndex - b.tabIndex);
+}
+
+/**
+ * A single global order for opening ALL replacement editors up front (batched
+ * choreography): by view column, then original left-to-right tab position within
+ * a column. Opening in this order preserves the relative tab-strip order among
+ * replacements while every open is backgrounded (preserveFocus), so the active
+ * editor never hops from tab to tab during the remap.
+ */
+export function orderReopens(actions: ReopenAction[]): ReopenAction[] {
+    return [...actions].sort((a, b) => a.viewColumn - b.viewColumn || a.tabIndex - b.tabIndex);
+}
+
+/**
+ * The one replacement that should receive focus at the end of a batched remap:
+ * the equivalent of the tab that was globally active (active tab of the active
+ * group) before the remap. Undefined when the active tab wasn't a remapped stray
+ * (dirty-skipped, closeMissing, or belonged to another repo) — in which case the
+ * caller performs no focus move and leaves focus where VS Code left it.
+ */
+export function focusTarget(plan: TabRemapPlan): ReopenAction | undefined {
+    return plan.reopen.find((a) => a.focusGlobally);
 }

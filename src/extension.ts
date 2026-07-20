@@ -5,7 +5,8 @@ import { getGitCommonDir, getSuperprojectPath, listWorktrees, type Worktree } fr
 import { waitForClientReady, type ObservableClient } from "./lsReady";
 import { PositionCache } from "./positionCache";
 import {
-    orderColumnReopens,
+    focusTarget,
+    orderReopens,
     planSiblingIntercept,
     planTabRemap,
     relPathUnder,
@@ -148,6 +149,20 @@ const inFlightIntercepts = new Set<string>();
 // the OLD root, so sibling/active classification is inverted — interception must
 // stand down or it bounces the switch's own carried tabs back (log4.txt L70–95).
 let switchInProgress = false;
+// False until the activation-path reconcile-on-open has run once (or a safety
+// timeout elapses). During the grace window, per-tab interception stays off so
+// VS Code's session-restored sibling tabs get ONE quiet batched reconcile instead
+// of N individual intercepts racing it.
+let startupReconcileDone = false;
+// Safety net: never keep interception off forever if reconcile never runs (e.g.
+// carryTabs off, or no repo). Measured startup well under this.
+const STARTUP_GRACE_MS = 10_000;
+
+function markStartupReconcileDone(): void {
+    if (startupReconcileDone) {return;}
+    startupReconcileDone = true;
+    log("Startup grace complete: sibling-open interception enabled");
+}
 
 /** The discovered non-bare worktree that contains `fsPath` (longest match), if any. */
 function worktreeOfPath(fsPath: string): { commonDir: string; path: string; label: string } | null {
@@ -434,6 +449,7 @@ async function interceptSiblingOpen(doc: vscode.TextDocument): Promise<void> {
     if (
         !shouldConsiderIntercept({
             enabled: interceptSiblingOpens,
+            startupGracePassed: startupReconcileDone,
             switchInProgress,
             extensionDrivenOpen: applyRemapDepth > 0,
             scheme: doc.uri.scheme,
@@ -872,6 +888,11 @@ export function activate(context: vscode.ExtensionContext) {
         { dispose: () => positionCache?.dispose() }
     );
 
+    // Safety net: enable interception even if the reconcile path below never runs
+    // (anchoring restart, carryTabs off, no repo), so it can't stay off forever.
+    const graceTimer = setTimeout(markStartupReconcileDone, STARTUP_GRACE_MS);
+    context.subscriptions.push({ dispose: () => clearTimeout(graceTimer) });
+
     setTimeout(async () => {
         try {
             // Establish the anchor layout now (folding its one-time restart into
@@ -890,6 +911,9 @@ export function activate(context: vscode.ExtensionContext) {
             await updateWindowTitle();
         } catch (e) {
             log(`Pre-warm failed: ${e instanceof Error ? e.message : String(e)}`);
+        } finally {
+            // Initial reconcile has run once — per-tab interception may now engage.
+            markStartupReconcileDone();
         }
     }, 100);
 }
@@ -1066,8 +1090,16 @@ async function openReopenAction(action: ReopenAction, preserveFocus: boolean): P
 }
 
 /**
- * Apply a remap plan: close the resolved old-worktree tabs, then reopen the
- * equivalent files in the new worktree, restoring per-tab position and focus.
+ * Apply a remap plan. Batched choreography (kills the open-time tab flicker):
+ *   (a) note which stray was the globally-active tab;
+ *   (b) open ALL replacement editors first, in the background (preserveFocus), in
+ *       (column, tabIndex) order, applying each saved selection/scroll;
+ *   (c) close ALL strays (reopened + no-target) in a single batch;
+ *   (d) exactly one focus move — to the replacement of the previously-active
+ *       stray, or none if the active tab wasn't a remapped stray.
+ * Remap semantics (dirty-skip, closeMissing, relative order, restored position)
+ * are unchanged; only the sequencing differs. The whole sequence stays inside the
+ * applyRemapDepth window so every open/close reads as self/remap, not external.
  */
 export async function applyTabRemap(
     plan: TabRemapPlan,
@@ -1077,8 +1109,19 @@ export async function applyTabRemap(
     applyRemapDepth++;
     cache?.suspend();
     try {
-        // Close the tabs we're going to reopen and the ones with no target.
-        // Dirty tabs (plan.skipDirty) are deliberately left open.
+        // (a) The one replacement that should end up focused (equivalent of the
+        // previously globally-active stray), or undefined to leave focus be.
+        const focus = focusTarget(plan);
+
+        // (b) Open every replacement in the background BEFORE closing anything, so
+        // the active editor never hops across intermediate tabs. revealRange still
+        // restores scroll on a non-focused editor.
+        for (const a of orderReopens(plan.reopen)) {
+            await openReopenAction(a, true);
+        }
+
+        // (c) Close all strays we reopened plus the no-target ones, in a single
+        // batch. Dirty tabs (plan.skipDirty) are deliberately left open.
         const toClose: vscode.Tab[] = [];
         for (const a of [...plan.reopen, ...plan.closeMissing]) {
             const t = tabByKey.get(tabKey(a.viewColumn, a.sourcePath));
@@ -1088,33 +1131,9 @@ export async function applyTabRemap(
             await vscode.window.tabGroups.close(toClose, true);
         }
 
-        // Reopen per column in the ORIGINAL tab order (so the tab strip order is
-        // preserved), each materializing to apply its cached position. After a
-        // column's tabs are all open, re-show its active tab to bring it to the
-        // foreground in place (without moving it). Finally, focus the globally
-        // active tab.
-        const byColumn = new Map<number, ReopenAction[]>();
-        for (const a of plan.reopen) {
-            const arr = byColumn.get(a.viewColumn) ?? [];
-            arr.push(a);
-            byColumn.set(a.viewColumn, arr);
-        }
-
-        let focusAction: ReopenAction | undefined;
-        for (const [, actions] of byColumn) {
-            const ordered = orderColumnReopens(actions);
-            for (const a of ordered) {
-                await openReopenAction(a, true);
-            }
-            const active = ordered.find((a) => a.makeActiveInGroup);
-            if (active) {
-                // Re-reveal the active tab in place (already open → not reordered).
-                await openReopenAction(active, true);
-                if (active.focusGlobally) {focusAction = active;}
-            }
-        }
-        if (focusAction) {
-            await openReopenAction(focusAction, false);
+        // (d) Exactly one focus move.
+        if (focus) {
+            await openReopenAction(focus, false);
         }
     } finally {
         cache?.resume();
@@ -1650,6 +1669,10 @@ export const __test = {
     /** Simulate the switch critical section for tests (interception stands down). */
     setSwitchInProgress(value: boolean): void {
         switchInProgress = value;
+    },
+    /** Drive the startup-grace flag: interception is inert until this is true. */
+    setStartupReconcileDone(value: boolean): void {
+        startupReconcileDone = value;
     },
     interceptSiblingTabOpen,
 };

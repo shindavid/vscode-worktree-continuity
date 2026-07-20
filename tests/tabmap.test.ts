@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+    focusTarget,
     orderColumnReopens,
+    orderReopens,
     planSiblingIntercept,
     planTabRemap,
     relPathUnder,
@@ -9,8 +11,20 @@ import {
     type CachedPosition,
     type InterceptGate,
     type ReopenAction,
+    type TabRemapPlan,
     type TabSnapshot,
 } from "../src/tabmap";
+
+const reopen = (o: Partial<ReopenAction>): ReopenAction => ({
+    sourcePath: "/a/x.ts",
+    targetPath: "/b/x.ts",
+    relPath: "x.ts",
+    viewColumn: 1,
+    tabIndex: 0,
+    makeActiveInGroup: false,
+    focusGlobally: false,
+    ...o,
+});
 
 const OLD = "/repo/wt-a";
 const NEW = "/repo/wt-b";
@@ -198,6 +212,49 @@ describe("orderColumnReopens", () => {
     });
 });
 
+describe("orderReopens (batched open order)", () => {
+    it("orders by view column, then original tab index within a column", () => {
+        const ordered = orderReopens([
+            reopen({ relPath: "c2-second", viewColumn: 2, tabIndex: 1 }),
+            reopen({ relPath: "c1-second", viewColumn: 1, tabIndex: 1 }),
+            reopen({ relPath: "c2-first", viewColumn: 2, tabIndex: 0 }),
+            reopen({ relPath: "c1-first", viewColumn: 1, tabIndex: 0 }),
+        ]);
+        expect(ordered.map((a) => a.relPath)).toEqual([
+            "c1-first",
+            "c1-second",
+            "c2-first",
+            "c2-second",
+        ]);
+    });
+
+    it("does not mutate the input array", () => {
+        const input = [reopen({ tabIndex: 2 }), reopen({ tabIndex: 0 })];
+        const before = input.map((a) => a.tabIndex);
+        orderReopens(input);
+        expect(input.map((a) => a.tabIndex)).toEqual(before);
+    });
+});
+
+describe("focusTarget (single-focus outcome)", () => {
+    const plan = (reopens: ReopenAction[]): TabRemapPlan => ({
+        reopen: reopens,
+        closeMissing: [],
+        skipDirty: [],
+    });
+
+    it("returns the reopen flagged focusGlobally", () => {
+        const active = reopen({ relPath: "active.ts", focusGlobally: true });
+        const target = focusTarget(plan([reopen({ relPath: "a.ts" }), active, reopen({ relPath: "b.ts" })]));
+        expect(target).toBe(active);
+    });
+
+    it("returns undefined when no reopen is globally active (active tab wasn't a stray)", () => {
+        const target = focusTarget(plan([reopen({ relPath: "a.ts" }), reopen({ relPath: "b.ts" })]));
+        expect(target).toBeUndefined();
+    });
+});
+
 describe("planSiblingIntercept", () => {
     const ACTIVE = "/repo/feature";
     const SIBLING = "/repo/main";
@@ -258,6 +315,7 @@ describe("shouldConsiderIntercept", () => {
     // A gate that WOULD intercept; each test flips one field.
     const base: InterceptGate = {
         enabled: true,
+        startupGracePassed: true,
         switchInProgress: false,
         extensionDrivenOpen: false,
         scheme: "file",
@@ -273,6 +331,10 @@ describe("shouldConsiderIntercept", () => {
 
     it("rejects when interception is disabled", () => {
         expect(shouldConsiderIntercept({ ...base, enabled: false })).toBe(false);
+    });
+
+    it("rejects during the startup grace window", () => {
+        expect(shouldConsiderIntercept({ ...base, startupGracePassed: false })).toBe(false);
     });
 
     it("rejects during a switch critical section (Defect 1)", () => {

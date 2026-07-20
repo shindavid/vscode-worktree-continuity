@@ -51,13 +51,15 @@ suite("sibling-open interception (integration)", () => {
     });
 
     setup(() => {
-        // Each test starts on feature with no switch in progress.
+        // Each test starts on feature, no switch in progress, past startup grace.
         __test.setActiveWorktree(fx.featureRoot);
         __test.setSwitchInProgress(false);
+        __test.setStartupReconcileDone(true);
     });
 
     teardown(async () => {
         __test.setSwitchInProgress(false);
+        __test.setStartupReconcileDone(true);
         await vscode.commands.executeCommand("workbench.action.closeAllEditors");
         await waitUntil(() => vscode.window.tabGroups.all.every((g) => g.tabs.length === 0));
     });
@@ -178,5 +180,28 @@ suite("sibling-open interception (integration)", () => {
         await __test.interceptSiblingOpen(mDoc);
         await waitUntil(() => isOpen(featCpp) && !isOpen(mainCpp), 6000);
         assert.strictEqual(isOpen(mainCpp), false, "genuine sibling open intercepted after resume");
+    });
+
+    // Startup grace: interception is inert until the initial reconcile-on-open has
+    // run once, then active.
+    test("is inert during startup grace and active after it completes", async () => {
+        const mainCpp = path.join(fx.mainRoot, "src", "greeting.cpp");
+        const featCpp = path.join(fx.featureRoot, "src", "greeting.cpp");
+
+        // Grace window: interception must NOT fire.
+        __test.setStartupReconcileDone(false);
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(mainCpp));
+        await vscode.window.showTextDocument(doc, { preview: false });
+        await waitUntil(() => isOpen(mainCpp));
+        await __test.interceptSiblingOpen(doc);
+        await new Promise((r) => setTimeout(r, 200));
+        assert.strictEqual(isOpen(mainCpp), true, "stray left intact during startup grace");
+        assert.strictEqual(isOpen(featCpp), false, "no remap during startup grace");
+
+        // Grace completes: the same open is now intercepted.
+        __test.setStartupReconcileDone(true);
+        await __test.interceptSiblingOpen(doc);
+        await waitUntil(() => isOpen(featCpp) && !isOpen(mainCpp), 6000);
+        assert.strictEqual(isOpen(mainCpp), false, "intercepted once startup grace completes");
     });
 });
