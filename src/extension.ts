@@ -9,6 +9,7 @@ import {
     planSiblingIntercept,
     planTabRemap,
     relPathUnder,
+    shouldConsiderIntercept,
     targetPathFor,
     type CachedPosition,
     type ReopenAction,
@@ -138,8 +139,15 @@ let applyRemapDepth = 0;
 // tabs to persist turn it off via __test.setInterceptionEnabled.
 let interceptSiblingOpens = true;
 // URIs currently being remapped, so the target-open / stray-close churn we
-// generate doesn't re-enter interception.
+// generate doesn't re-enter interception (and so the didOpen + tab-open triggers
+// dedupe to a single remap per stray).
 const inFlightIntercepts = new Set<string>();
+// True during a worktree switch's critical section (from before the switch's own
+// applyTabRemap until the active worktree is updated). During that window the
+// switch itself opens NEW-worktree tabs while activeWorktreePath still points at
+// the OLD root, so sibling/active classification is inverted — interception must
+// stand down or it bounces the switch's own carried tabs back (log4.txt L70–95).
+let switchInProgress = false;
 
 /** The discovered non-bare worktree that contains `fsPath` (longest match), if any. */
 function worktreeOfPath(fsPath: string): { commonDir: string; path: string; label: string } | null {
@@ -415,42 +423,59 @@ function positionFromEditor(editor: vscode.TextEditor): CachedPosition {
  * reconcile-on-detection loop; periodic reconcile stays as a backstop.
  */
 async function interceptSiblingOpen(doc: vscode.TextDocument): Promise<void> {
-    if (!interceptSiblingOpens) {return;}
-    if (doc.uri.scheme !== "file") {return;}
+    const active = activeWorktreePath;
+    const uriStr = doc.uri.toString();
     const carryTabs = vscode.workspace
         .getConfiguration()
         .get<boolean>("worktree-continuity.carryTabs", true);
-    if (!carryTabs) {return;}
-    const active = activeWorktreePath;
-    if (!active) {return;}
-    const uriStr = doc.uri.toString();
-    if (inFlightIntercepts.has(uriStr)) {return;}
-    // Never close a dirty document (its edits may only exist here).
-    if (doc.isDirty) {return;}
+    // Cheap, state-only pre-plan gate (pure). Notably: never intercept while a
+    // switch is in flight or while the extension itself is opening tabs
+    // (applyRemapDepth>0) — both invert or self-trigger the classification.
+    if (
+        !shouldConsiderIntercept({
+            enabled: interceptSiblingOpens,
+            switchInProgress,
+            extensionDrivenOpen: applyRemapDepth > 0,
+            scheme: doc.uri.scheme,
+            carryTabs,
+            hasActiveWorktree: !!active,
+            alreadyInFlight: inFlightIntercepts.has(uriStr),
+            isDirty: doc.isDirty,
+        })
+    ) {
+        return;
+    }
     const p = doc.uri.fsPath;
     const wt = worktreeOfPath(p);
     const plan = planSiblingIntercept(p, active, wt?.path ?? null, samePath);
     if (!plan.intercept) {return;}
-    const target = plan.targetPath;
-    const rel = plan.relPath;
-    if (!(await pathExists(target))) {return;}
-
+    // Claim this URI synchronously, before any await, so the didOpen and tab-open
+    // triggers for the same stray can't both slip past the in-flight check.
     inFlightIntercepts.add(uriStr);
     try {
+        const target = plan.targetPath;
+        const rel = plan.relPath;
+        if (!(await pathExists(target))) {return;}
+
         // Position fidelity: wait briefly for the stray editor so we can read the
-        // exact go-to-def selection; fall back to the position cache otherwise.
-        const editor = await waitForVisibleEditor(doc.uri, 150);
+        // go-to-def selection; fall back to the position cache otherwise.
+        await waitForVisibleEditor(doc.uri, 150);
         if (hasDiffTabFor(doc.uri)) {
             log(`Intercept skipped (diff editor): ${p}`);
             return;
         }
         const stray = findTextTab(doc.uri);
         if (!stray) {return;} // no tab to remap (never painted, or already gone)
-        const viewColumn = editor?.viewColumn ?? stray.viewColumn;
 
+        // Re-read the LIVE editor's selection as late as possible — a go-to-def
+        // target selection can land after the initial open, so latest wins.
+        const liveEditor = vscode.window.visibleTextEditors.find(
+            (e) => e.document.uri.toString() === uriStr
+        );
+        const viewColumn = liveEditor?.viewColumn ?? stray.viewColumn;
         let position: CachedPosition | undefined;
-        if (editor) {
-            position = positionFromEditor(editor);
+        if (liveEditor) {
+            position = positionFromEditor(liveEditor);
         } else {
             const key = resolveCacheKey(target);
             position = key ? positionCache?.get(key.commonDir, key.relPath) : undefined;
@@ -486,6 +511,26 @@ async function interceptSiblingOpen(doc: vscode.TextDocument): Promise<void> {
         log(`Intercept failed for ${p}: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
         inFlightIntercepts.delete(uriStr);
+    }
+}
+
+/**
+ * Trigger interception from a newly-opened tab (Defect 2 in log4.txt): a
+ * Go-to-Definition into a document that was ALREADY loaded earlier in the session
+ * fires no onDidOpenTextDocument, so only a tab opens. Feed those external text
+ * tabs through the same interceptor; the in-flight set dedupes against the
+ * didOpen trigger.
+ */
+function interceptSiblingTabOpen(e: vscode.TabChangeEvent): void {
+    if (applyRemapDepth > 0) {return;} // our own remap churn
+    for (const t of e.opened) {
+        if (!(t.input instanceof vscode.TabInputText)) {continue;}
+        const uri = t.input.uri;
+        if (uri.scheme !== "file") {continue;}
+        const doc = vscode.workspace.textDocuments.find(
+            (d) => d.uri.toString() === uri.toString()
+        );
+        if (doc) {void interceptSiblingOpen(doc);}
     }
 }
 
@@ -819,6 +864,9 @@ export function activate(context: vscode.ExtensionContext) {
         // which can make a shared language server resolve symbols to the wrong copy.
         vscode.window.tabGroups.onDidChangeTabs((e) => {
             logTabChanges(e);
+            // Also intercept from the tab-open signal: a nav into an already-loaded
+            // document fires no onDidOpenTextDocument (Defect 2). Deduped by URI.
+            interceptSiblingTabOpen(e);
             scheduleMixedWorktreeCheck();
         }),
         { dispose: () => positionCache?.dispose() }
@@ -1249,56 +1297,66 @@ async function performSwitch(repo: RepoSnapshot, worktree: Worktree): Promise<vo
             `shouldCarry=${shouldCarry}`
     );
 
-    // Carry tabs BEFORE touching workspace folders. On the one-time setup switch
-    // this matters (it changes folder[0] → a restart that would kill this
-    // command); on subsequent index-1 swaps there's no restart, so it's just
-    // consistent ordering.
-    let dropped: string | null = null;
-    if (shouldCarry && oldRoot) {
-        try {
-            const commonDir = repo.commonDir;
-            const { plan, tabByKey } = await buildTabRemapPlan(oldRoot, newRoot, (rel) =>
-                positionCache?.get(commonDir, rel)
-            );
-            log(
-                `Plan: reopen=${plan.reopen.length} closeMissing=${plan.closeMissing.length} ` +
-                    `skipDirty=${plan.skipDirty.length}`
-            );
-            await applyTabRemap(plan, tabByKey, positionCache ?? undefined);
-            log(`applyTabRemap complete (reopened ${plan.reopen.length} tab(s))`);
-            dropped = summarizeDropped(plan);
-        } catch (e) {
-            log(`tab carry failed: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+    // Suspend interception across the whole critical section: while we carry tabs
+    // the switch opens NEW-worktree tabs but activeWorktreePath still points at the
+    // OLD root, so the interceptor would classify them as siblings and bounce them
+    // back (log4.txt). Stays suspended until the active worktree is updated below.
+    switchInProgress = true;
+    try {
+        // Carry tabs BEFORE touching workspace folders. On the one-time setup switch
+        // this matters (it changes folder[0] → a restart that would kill this
+        // command); on subsequent index-1 swaps there's no restart, so it's just
+        // consistent ordering.
+        let dropped: string | null = null;
+        if (shouldCarry && oldRoot) {
+            try {
+                const commonDir = repo.commonDir;
+                const { plan, tabByKey } = await buildTabRemapPlan(oldRoot, newRoot, (rel) =>
+                    positionCache?.get(commonDir, rel)
+                );
+                log(
+                    `Plan: reopen=${plan.reopen.length} closeMissing=${plan.closeMissing.length} ` +
+                        `skipDirty=${plan.skipDirty.length}`
+                );
+                await applyTabRemap(plan, tabByKey, positionCache ?? undefined);
+                log(`applyTabRemap complete (reopened ${plan.reopen.length} tab(s))`);
+                dropped = summarizeDropped(plan);
+            } catch (e) {
+                log(`tab carry failed: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+            }
         }
-    }
 
-    // Optimistically mark the target active for instant green feedback; the
-    // onDidChangeWorkspaceFolders handler re-derives it authoritatively after
-    // the swap (and after a setup restart, activate() derives it from folders).
-    activeWorktreePath = newRoot;
-    worktreeView?.setActive(newRoot);
-    await positionCache?.flush();
+        // Optimistically mark the target active for instant green feedback; the
+        // onDidChangeWorkspaceFolders handler re-derives it authoritatively after
+        // the swap (and after a setup restart, activate() derives it from folders).
+        // From this point, sibling/active classification is correct again.
+        activeWorktreePath = newRoot;
+        worktreeView?.setActive(newRoot);
+        await positionCache?.flush();
 
-    const label = worktreeLabel(worktree);
-    const base = `Switched to ${label}`;
-    if (dropped) {
-        vscode.window.showWarningMessage(`${base}. ${dropped}.`);
-    } else {
-        vscode.window.showInformationMessage(base);
-    }
+        const label = worktreeLabel(worktree);
+        const base = `Switched to ${label}`;
+        if (dropped) {
+            vscode.window.showWarningMessage(`${base}. ${dropped}.`);
+        } else {
+            vscode.window.showInformationMessage(base);
+        }
 
-    const anchorEntry = { uri: vscode.Uri.file(anchor), name: ANCHOR_FOLDER_NAME };
-    const worktreeEntry = { uri: vscode.Uri.file(newRoot), name: label };
-    if (isSetUp) {
-        // Swap only folder[1..] → the target worktree. folder[0] (anchor) stays,
-        // so NO extension-host restart.
-        log(`Swapping worktree at folder index 1 (expecting NO restart)`);
-        vscode.workspace.updateWorkspaceFolders(1, folders.length - 1, worktreeEntry);
-    } else {
-        // One-time: establish [anchor, worktree]. This changes folder[0] → a
-        // single restart. From here on, switches are restart-free.
-        log(`Establishing [anchor, worktree] layout (one-time restart)`);
-        vscode.workspace.updateWorkspaceFolders(0, folders.length, anchorEntry, worktreeEntry);
+        const anchorEntry = { uri: vscode.Uri.file(anchor), name: ANCHOR_FOLDER_NAME };
+        const worktreeEntry = { uri: vscode.Uri.file(newRoot), name: label };
+        if (isSetUp) {
+            // Swap only folder[1..] → the target worktree. folder[0] (anchor) stays,
+            // so NO extension-host restart.
+            log(`Swapping worktree at folder index 1 (expecting NO restart)`);
+            vscode.workspace.updateWorkspaceFolders(1, folders.length - 1, worktreeEntry);
+        } else {
+            // One-time: establish [anchor, worktree]. This changes folder[0] → a
+            // single restart. From here on, switches are restart-free.
+            log(`Establishing [anchor, worktree] layout (one-time restart)`);
+            vscode.workspace.updateWorkspaceFolders(0, folders.length, anchorEntry, worktreeEntry);
+        }
+    } finally {
+        switchInProgress = false;
     }
 }
 
@@ -1589,5 +1647,10 @@ export const __test = {
     setInterceptionEnabled(enabled: boolean): void {
         interceptSiblingOpens = enabled;
     },
+    /** Simulate the switch critical section for tests (interception stands down). */
+    setSwitchInProgress(value: boolean): void {
+        switchInProgress = value;
+    },
+    interceptSiblingTabOpen,
 };
 

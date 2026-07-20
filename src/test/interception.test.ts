@@ -24,6 +24,17 @@ function isOpen(fsPath: string): boolean {
     );
 }
 
+function findTab(fsPath: string): vscode.Tab | undefined {
+    for (const g of vscode.window.tabGroups.all) {
+        for (const t of g.tabs) {
+            if (t.input instanceof vscode.TabInputText && t.input.uri.fsPath === fsPath) {
+                return t;
+            }
+        }
+    }
+    return undefined;
+}
+
 suite("sibling-open interception (integration)", () => {
     let fx: WorktreeFixture;
 
@@ -39,7 +50,14 @@ suite("sibling-open interception (integration)", () => {
         fx.cleanup();
     });
 
+    setup(() => {
+        // Each test starts on feature with no switch in progress.
+        __test.setActiveWorktree(fx.featureRoot);
+        __test.setSwitchInProgress(false);
+    });
+
     teardown(async () => {
+        __test.setSwitchInProgress(false);
         await vscode.commands.executeCommand("workbench.action.closeAllEditors");
         await waitUntil(() => vscode.window.tabGroups.all.every((g) => g.tabs.length === 0));
     });
@@ -86,5 +104,79 @@ suite("sibling-open interception (integration)", () => {
         await __test.interceptSiblingOpen(doc);
         await new Promise((r) => setTimeout(r, 200));
         assert.strictEqual(isOpen(featCpp), true, "active-worktree file stays open, untouched");
+    });
+
+    // Defect 2 (log4.txt L151): a nav into an ALREADY-LOADED sibling document
+    // fires no onDidOpenTextDocument, so only a tab opens — the tab trigger must
+    // catch it. Reproduce: load the doc while it's NOT a sibling (active = its own
+    // worktree), then flip active and re-show it (no didOpen) and drive the tab
+    // trigger the production listener uses.
+    test("intercepts a nav into an already-loaded sibling document via the tab trigger", async () => {
+        const mainCpp = path.join(fx.mainRoot, "src", "greeting.cpp");
+        const featCpp = path.join(fx.featureRoot, "src", "greeting.cpp");
+
+        // Load main/greeting.cpp while active = main (it is NOT a sibling then).
+        __test.setActiveWorktree(fx.mainRoot);
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(mainCpp));
+        await vscode.window.showTextDocument(doc, { preview: false });
+        await waitUntil(() => isOpen(mainCpp));
+        await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
+        await waitUntil(() => !isOpen(mainCpp));
+
+        // Flip active to feature; the doc object stays loaded, so re-showing it
+        // fires NO onDidOpenTextDocument — only a tab opens.
+        __test.setActiveWorktree(fx.featureRoot);
+        await vscode.window.showTextDocument(doc, {
+            selection: new vscode.Selection(9, 1, 9, 1),
+            preview: false,
+        });
+        await waitUntil(() => isOpen(mainCpp));
+        const tab = findTab(mainCpp);
+        assert.ok(tab, "the stray main tab is open");
+        // Drive the tab-open trigger (the didOpen path would NOT fire here).
+        __test.interceptSiblingTabOpen({ opened: [tab!], closed: [], changed: [] });
+
+        await waitUntil(() => isOpen(featCpp) && !isOpen(mainCpp), 6000);
+        const active = vscode.window.activeTextEditor;
+        assert.ok(active && active.document.uri.fsPath === featCpp, "remapped to feature equivalent");
+        assert.strictEqual(active!.selection.active.line, 9, "position carried via the tab trigger");
+        assert.strictEqual(isOpen(mainCpp), false, "the stray main tab was closed");
+    });
+
+    // Defect 1 (log4.txt L70–95): during a switch, activeWorktreePath still points
+    // at the OLD root while the switch opens NEW-root tabs, so those look like
+    // siblings. Interception must stand down for the whole critical section, then
+    // resume normally.
+    test("stands down during the switch critical section, then resumes", async () => {
+        const mainCpp = path.join(fx.mainRoot, "src", "greeting.cpp");
+        const featCpp = path.join(fx.featureRoot, "src", "greeting.cpp");
+
+        // Inverted window: active is still OLD (main) while the switch carries a
+        // NEW-root (feature) tab in. Suspension must prevent a bounce to main.
+        __test.setActiveWorktree(fx.mainRoot);
+        __test.setSwitchInProgress(true);
+        try {
+            const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(featCpp));
+            await vscode.window.showTextDocument(doc, { preview: false });
+            await waitUntil(() => isOpen(featCpp));
+            await __test.interceptSiblingOpen(doc);
+            await new Promise((r) => setTimeout(r, 200));
+            assert.strictEqual(isOpen(featCpp), true, "new-worktree tab left intact during switch");
+            assert.strictEqual(isOpen(mainCpp), false, "no bounce back to the old worktree");
+        } finally {
+            __test.setSwitchInProgress(false);
+        }
+
+        // After the critical section (active now feature), a genuine sibling open
+        // IS intercepted.
+        await vscode.commands.executeCommand("workbench.action.closeAllEditors");
+        await waitUntil(() => vscode.window.tabGroups.all.every((g) => g.tabs.length === 0));
+        __test.setActiveWorktree(fx.featureRoot);
+        const mDoc = await vscode.workspace.openTextDocument(vscode.Uri.file(mainCpp));
+        await vscode.window.showTextDocument(mDoc, { preview: false });
+        await waitUntil(() => isOpen(mainCpp));
+        await __test.interceptSiblingOpen(mDoc);
+        await waitUntil(() => isOpen(featCpp) && !isOpen(mainCpp), 6000);
+        assert.strictEqual(isOpen(mainCpp), false, "genuine sibling open intercepted after resume");
     });
 });

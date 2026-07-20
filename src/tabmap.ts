@@ -97,6 +97,43 @@ export function targetPathFor(oldRoot: string, newRoot: string, tabPath: string)
     return path.join(newRoot, rel);
 }
 
+export interface InterceptGate {
+    /** Feature toggle (off in suites that need strays to persist). */
+    enabled: boolean;
+    /** True during a worktree switch's critical section, where sibling/active
+     * classification is inverted by design — never intercept then. */
+    switchInProgress: boolean;
+    /** True when the open was driven by the extension itself (applyRemapDepth>0);
+     * our own tab churn must never be mistaken for a user stray. */
+    extensionDrivenOpen: boolean;
+    scheme: string;
+    carryTabs: boolean;
+    hasActiveWorktree: boolean;
+    /** This URI is already being remapped (dedupes the didOpen + tab triggers). */
+    alreadyInFlight: boolean;
+    isDirty: boolean;
+}
+
+/**
+ * Pure pre-plan gate for sibling-open interception: the cheap, state-only checks
+ * that decide whether an open is even a candidate, before the geometry
+ * (planSiblingIntercept) and the filesystem existence check run. Kept pure so the
+ * gating — including the switch-critical-section and self-open guards added after
+ * the log4.txt repro — is unit-testable.
+ */
+export function shouldConsiderIntercept(g: InterceptGate): boolean {
+    return (
+        g.enabled &&
+        !g.switchInProgress &&
+        !g.extensionDrivenOpen &&
+        g.scheme === "file" &&
+        g.carryTabs &&
+        g.hasActiveWorktree &&
+        !g.alreadyInFlight &&
+        !g.isDirty
+    );
+}
+
 export type SiblingInterceptPlan =
     | { intercept: false; reason: string }
     | { intercept: true; targetPath: string; relPath: string };

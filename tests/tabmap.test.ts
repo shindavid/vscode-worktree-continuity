@@ -4,8 +4,10 @@ import {
     planSiblingIntercept,
     planTabRemap,
     relPathUnder,
+    shouldConsiderIntercept,
     targetPathFor,
     type CachedPosition,
+    type InterceptGate,
     type ReopenAction,
     type TabSnapshot,
 } from "../src/tabmap";
@@ -249,5 +251,47 @@ describe("planSiblingIntercept", () => {
             a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
         const plan = planSiblingIntercept("/other/x.cpp", ACTIVE, ACTIVE + "/", sameRoot);
         expect(plan).toEqual({ intercept: false, reason: "same as active worktree" });
+    });
+});
+
+describe("shouldConsiderIntercept", () => {
+    // A gate that WOULD intercept; each test flips one field.
+    const base: InterceptGate = {
+        enabled: true,
+        switchInProgress: false,
+        extensionDrivenOpen: false,
+        scheme: "file",
+        carryTabs: true,
+        hasActiveWorktree: true,
+        alreadyInFlight: false,
+        isDirty: false,
+    };
+
+    it("passes when every gate is favorable", () => {
+        expect(shouldConsiderIntercept(base)).toBe(true);
+    });
+
+    it("rejects when interception is disabled", () => {
+        expect(shouldConsiderIntercept({ ...base, enabled: false })).toBe(false);
+    });
+
+    it("rejects during a switch critical section (Defect 1)", () => {
+        expect(shouldConsiderIntercept({ ...base, switchInProgress: true })).toBe(false);
+    });
+
+    it("rejects an extension-driven open (our own remap churn)", () => {
+        expect(shouldConsiderIntercept({ ...base, extensionDrivenOpen: true })).toBe(false);
+    });
+
+    it("rejects non-file schemes", () => {
+        expect(shouldConsiderIntercept({ ...base, scheme: "git" })).toBe(false);
+        expect(shouldConsiderIntercept({ ...base, scheme: "output" })).toBe(false);
+    });
+
+    it("rejects when carryTabs is off, no active worktree, in-flight, or dirty", () => {
+        expect(shouldConsiderIntercept({ ...base, carryTabs: false })).toBe(false);
+        expect(shouldConsiderIntercept({ ...base, hasActiveWorktree: false })).toBe(false);
+        expect(shouldConsiderIntercept({ ...base, alreadyInFlight: true })).toBe(false);
+        expect(shouldConsiderIntercept({ ...base, isDirty: true })).toBe(false);
     });
 });
