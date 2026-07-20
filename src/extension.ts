@@ -6,7 +6,7 @@ import { waitForClientReady, type ObservableClient } from "./lsReady";
 import { PositionCache } from "./positionCache";
 import {
     focusTarget,
-    orderReopens,
+    orderReopensByGroup,
     planSiblingIntercept,
     planTabRemap,
     relPathUnder,
@@ -1129,17 +1129,21 @@ async function openReopenAction(action: ReopenAction, preserveFocus: boolean): P
 }
 
 /**
- * Apply a remap plan. Stable-strip choreography — the tab strip peaks at N+1
- * (not 2N) and the focused editor's visible content never changes:
- *   (1) if the globally-active tab is a remapped stray, open ITS replacement
- *       first WITH focus (identical content + restored position → perceived no-op
- *       in the editor area, and focus is settled before any close);
+ * Apply a remap plan. Per-group stable-strip choreography — strip peaks at N+1
+ * (not 2N), each editor GROUP ends showing the right tab, and keyboard focus
+ * moves exactly once:
+ *   (1) if the globally-active tab is a remapped stray, open its replacement WITH
+ *       focus first, so the focused editor shows correct content before the close
+ *       (no blank flash);
  *   (2) batch-close ALL strays (reopened + no-target, minus dirty-skips) in one
- *       tabGroups.close call;
- *   (3) open the remaining replacements in the background (preserveFocus), in
- *       (column, tabIndex) order.
- * If the active tab isn't a stray, step (1) is skipped and focus never moves —
- * the remaining replacements just open in the background batch.
+ *       call;
+ *   (3) open replacements grouped by column, each column's previously-visible
+ *       tab opened LAST in that column (so, since showTextDocument always reveals
+ *       in its group, every group ends showing the correct tab). Non-focused
+ *       groups always use preserveFocus, so they never steal keyboard focus; a
+ *       group whose visible tab was NOT a stray gets that original tab re-shown
+ *       last. The active group is processed LAST and its visible tab is the one
+ *       op that takes focus — the single keyboard-focus move.
  * Remap semantics (dirty-skip, closeMissing, relative order, restored position)
  * are unchanged. The whole sequence stays inside the applyRemapDepth window so
  * every open/close reads as self/remap, not external.
@@ -1152,18 +1156,27 @@ export async function applyTabRemap(
     applyRemapDepth++;
     cache?.suspend();
     try {
-        // (1) The replacement of the previously globally-active stray, if any.
         const focus = focusTarget(plan);
-        // Remember the pre-remap active editor so, if the active tab was NOT a
-        // remapped stray, we can restore focus to it (a background open of a
-        // replacement still becomes the active editor, so we must put it back).
-        const preActiveUri = vscode.window.activeTextEditor?.document.uri;
+        // Snapshot each group's currently-visible (active) tab URI, so a group
+        // whose visible tab isn't a remapped stray can be restored to it after
+        // background opens (a background open still becomes its group's visible
+        // tab). Also note which column holds global keyboard focus.
+        const groupVisible = new Map<number, vscode.Uri>();
+        for (const g of vscode.window.tabGroups.all) {
+            const t = g.activeTab;
+            if (t?.input instanceof vscode.TabInputText) {
+                groupVisible.set(g.viewColumn, t.input.uri);
+            }
+        }
+        const activeColumn = focus?.viewColumn ?? vscode.window.activeTextEditor?.viewColumn;
+
+        // (1) Show the active group's visible replacement first, so the focused
+        // editor never blanks when its stray is closed.
         if (focus) {
             await openReopenAction(focus, false);
         }
 
-        // (2) Close all strays (reopened + no-target) in one batch. Dirty tabs
-        // (plan.skipDirty) are deliberately left open.
+        // (2) Batch-close all strays. Dirty tabs (plan.skipDirty) are left open.
         const toClose: vscode.Tab[] = [];
         for (const a of [...plan.reopen, ...plan.closeMissing]) {
             const t = tabByKey.get(tabKey(a.viewColumn, a.sourcePath));
@@ -1173,27 +1186,51 @@ export async function applyTabRemap(
             await vscode.window.tabGroups.close(toClose, true);
         }
 
-        // (3) Open the remaining replacements in the background, ordered by
-        // (column, tabIndex). revealRange still restores scroll on a non-focused
-        // editor. `focus` (if any) is already open, so skip it.
-        const rest = focus ? plan.reopen.filter((a) => a !== focus) : plan.reopen;
-        for (const a of orderReopens(rest)) {
-            await openReopenAction(a, true);
-        }
-
-        // (4) Settle focus deterministically. Background opens above change the
-        // active editor, so re-assert it exactly once: to the active stray's
-        // replacement, or — if the active tab wasn't a stray — back to it.
-        if (focus) {
-            await openReopenAction(focus, false);
-        } else if (rest.length > 0 && preActiveUri && isUriOpen(preActiveUri)) {
+        // (3) Open replacements per group, each group's final-visible tab LAST.
+        // Process non-active groups first (preserveFocus, never a focus steal),
+        // then the active group last so it ends up holding keyboard focus.
+        const groups = orderReopensByGroup(plan.reopen);
+        const restoreVisible = async (viewColumn: number, focusIt: boolean): Promise<void> => {
+            const uri = groupVisible.get(viewColumn);
+            if (!uri || !isUriOpen(uri)) {return;}
             try {
-                await vscode.window.showTextDocument(preActiveUri, {
-                    preserveFocus: false,
+                await vscode.window.showTextDocument(uri, {
+                    viewColumn,
+                    preserveFocus: !focusIt,
                     preview: false,
                 });
             } catch {
-                // best-effort focus restore
+                // best-effort visible-tab restore
+            }
+        };
+
+        for (const g of groups) {
+            if (g.viewColumn === activeColumn) {continue;} // active group handled last
+            for (const a of g.ordered) {
+                await openReopenAction(a, true);
+            }
+            // Visible tab wasn't a stray → re-show it last so the group shows it.
+            if (!g.hasVisibleReopen) {
+                await restoreVisible(g.viewColumn, false);
+            }
+        }
+
+        // Active group LAST: open its non-visible replacements in the background,
+        // then take focus exactly once on its final-visible tab.
+        const activeGroup = groups.find((g) => g.viewColumn === activeColumn);
+        if (activeGroup) {
+            for (const a of activeGroup.ordered) {
+                if (a === focus) {continue;} // focus opened separately, below
+                await openReopenAction(a, true);
+            }
+        }
+        if (focus) {
+            await openReopenAction(focus, false);
+        } else if (activeColumn !== undefined) {
+            // Active tab wasn't a stray: restore focus to it (only needed if a
+            // background open into its column stole the visible tab).
+            if (activeGroup && activeGroup.ordered.length > 0) {
+                await restoreVisible(activeColumn, true);
             }
         }
     } finally {

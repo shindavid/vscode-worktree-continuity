@@ -240,15 +240,45 @@ export function orderColumnReopens(actions: ReopenAction[]): ReopenAction[] {
     return [...actions].sort((a, b) => a.tabIndex - b.tabIndex);
 }
 
+export type GroupReopenOrder = {
+    viewColumn: number;
+    /** Reopens for this column, non-visible first (by tabIndex), then the
+     * previously-visible one (makeActiveInGroup) LAST so it ends up revealed. */
+    ordered: ReopenAction[];
+    /** True if this column's previously-visible tab was itself a remapped stray
+     * (so `ordered` ends with its replacement). False means the column's visible
+     * tab was NOT a stray — the caller must re-show that original visible tab last
+     * so a background open doesn't leave the wrong tab showing. */
+    hasVisibleReopen: boolean;
+};
+
 /**
- * A single global order for opening ALL replacement editors up front (batched
- * choreography): by view column, then original left-to-right tab position within
- * a column. Opening in this order preserves the relative tab-strip order among
- * replacements while every open is backgrounded (preserveFocus), so the active
- * editor never hops from tab to tab during the remap.
+ * Group reopen actions by view column and order each column so its final-visible
+ * tab is opened LAST. `showTextDocument` always reveals in its group, so opening
+ * a column's previously-visible replacement last leaves that column showing the
+ * right tab (fixing the non-focused-group fidelity regression), while everything
+ * before it can open in the background. Columns are returned in ascending order.
  */
-export function orderReopens(actions: ReopenAction[]): ReopenAction[] {
-    return [...actions].sort((a, b) => a.viewColumn - b.viewColumn || a.tabIndex - b.tabIndex);
+export function orderReopensByGroup(reopens: ReopenAction[]): GroupReopenOrder[] {
+    const byCol = new Map<number, ReopenAction[]>();
+    for (const a of reopens) {
+        const arr = byCol.get(a.viewColumn) ?? [];
+        arr.push(a);
+        byCol.set(a.viewColumn, arr);
+    }
+    return [...byCol.keys()]
+        .sort((a, b) => a - b)
+        .map((viewColumn) => {
+            const actions = byCol.get(viewColumn) ?? [];
+            const byIndex = (a: ReopenAction, b: ReopenAction): number => a.tabIndex - b.tabIndex;
+            const nonVisible = actions.filter((a) => !a.makeActiveInGroup).sort(byIndex);
+            const visible = actions.filter((a) => a.makeActiveInGroup).sort(byIndex);
+            return {
+                viewColumn,
+                ordered: [...nonVisible, ...visible],
+                hasVisibleReopen: visible.length > 0,
+            };
+        });
 }
 
 /**

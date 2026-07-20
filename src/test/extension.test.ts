@@ -188,6 +188,70 @@ suite("tab carry (integration)", () => {
         );
     });
 
+    test("multi-column remap: each group ends showing its correct tab, focus on the active group", async () => {
+        const aFoo = path.join(aRoot, "src", "foo.ts"); // col 1, will be globally active
+        const bFoo = path.join(bRoot, "src", "foo.ts");
+        const aBar = path.join(aRoot, "src", "bar.ts"); // col 2 stray (not visible there)
+        const bBar = path.join(bRoot, "src", "bar.ts");
+        const outside = path.join(dir, "outside2.ts"); // col 2 visible, NOT a stray
+        fs.writeFileSync(outside, FILE_BODY);
+
+        const groupActiveUri = (col: vscode.ViewColumn): string | undefined => {
+            const g = vscode.window.tabGroups.all.find((gr) => gr.viewColumn === col);
+            const t = g?.activeTab;
+            return t?.input instanceof vscode.TabInputText ? t.input.uri.fsPath : undefined;
+        };
+
+        // Column 2: a stray (bar) then a non-stray visible tab (outside).
+        await vscode.window.showTextDocument(vscode.Uri.file(aBar), {
+            viewColumn: vscode.ViewColumn.Two,
+            preview: false,
+        });
+        await vscode.window.showTextDocument(vscode.Uri.file(outside), {
+            viewColumn: vscode.ViewColumn.Two,
+            preview: false,
+        });
+        // Column 1: a stray (foo), made the globally-active tab.
+        await vscode.window.showTextDocument(vscode.Uri.file(aFoo), {
+            viewColumn: vscode.ViewColumn.One,
+            preview: false,
+        });
+        await waitUntil(() => isOpen(aFoo) && isOpen(aBar) && isOpen(outside));
+        await waitUntil(() => groupActiveUri(vscode.ViewColumn.One) === aFoo);
+        await waitUntil(() => groupActiveUri(vscode.ViewColumn.Two) === outside);
+
+        const { plan, tabByKey } = await buildTabRemapPlan(aRoot, bRoot, () => undefined);
+
+        // Track keyboard-focus landings: only the active-group settle should end
+        // on col 1. We assert the FINAL active editor is col 1's replacement.
+        await applyTabRemap(plan, tabByKey);
+
+        await waitUntil(() => !isOpen(aFoo) && !isOpen(aBar));
+        // Each group shows the right tab: col 1 → bFoo (active stray's replacement),
+        // col 2 → outside (its non-stray visible tab, restored — NOT the newly
+        // background-opened bBar).
+        await waitUntil(() => groupActiveUri(vscode.ViewColumn.One) === bFoo);
+        await waitUntil(() => groupActiveUri(vscode.ViewColumn.Two) === outside);
+        assert.strictEqual(groupActiveUri(vscode.ViewColumn.One), bFoo, "col 1 shows bar's replacement");
+        assert.strictEqual(
+            groupActiveUri(vscode.ViewColumn.Two),
+            outside,
+            "col 2 restored to its non-stray visible tab, not the background bBar"
+        );
+        assert.ok(isOpen(bBar), "col 2's stray was remapped (bBar opened in background)");
+        // Global keyboard focus settled exactly once, on the active group (col 1).
+        assert.strictEqual(
+            vscode.window.activeTextEditor?.document.uri.fsPath,
+            bFoo,
+            "keyboard focus ended on the active group's tab"
+        );
+        assert.strictEqual(
+            vscode.window.activeTextEditor?.viewColumn,
+            vscode.ViewColumn.One,
+            "focus is in column 1 (the active group), not stolen by column 2"
+        );
+    });
+
     test("closes a tab whose file has no equivalent in the new worktree", async () => {
         const aOnly = path.join(aRoot, "src", "only-in-a.ts");
         await vscode.window.showTextDocument(vscode.Uri.file(aOnly), { preview: false });
