@@ -185,12 +185,12 @@ describe("orderColumnReopens", () => {
         ...o,
     });
 
-    it("opens background tabs first in tab order, active tab last", () => {
+    it("preserves original left-to-right tab order regardless of which is active", () => {
         const ordered = orderColumnReopens([
             action({ relPath: "active.ts", tabIndex: 1, makeActiveInGroup: true }),
-            action({ relPath: "bg2.ts", tabIndex: 2 }),
-            action({ relPath: "bg0.ts", tabIndex: 0 }),
+            action({ relPath: "third.ts", tabIndex: 2 }),
+            action({ relPath: "first.ts", tabIndex: 0 }),
         ]);
-        expect(ordered.map((a) => a.relPath)).toEqual(["bg0.ts", "bg2.ts", "active.ts"]);
+        expect(ordered.map((a) => a.relPath)).toEqual(["first.ts", "active.ts", "third.ts"]);
     });
 });

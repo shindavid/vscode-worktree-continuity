@@ -38,7 +38,48 @@ let worktreeView: WorktreeViewProvider | null = null;
 let extensionContext: vscode.ExtensionContext | null = null;
 let activeWorktreePath: string | null = null;
 
+let worktreeWatchers: vscode.FileSystemWatcher[] = [];
+let watchedCommonDirs = "";
+let watcherRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+
 const PRIMED_REPOS_KEY = "worktree-continuity.lastRepos.v1";
+
+/**
+ * Watch each repo's `<git-common-dir>/worktrees/` directory so the view updates
+ * automatically when a worktree is added or removed. `git worktree add` doesn't
+ * change workspace folders, but it does create an admin directory there — the
+ * same signal git itself uses.
+ */
+function updateWorktreeWatchers(repos: RepoSnapshot[]): void {
+    const dirs = [...new Set(repos.map((r) => r.commonDir))].sort();
+    const key = dirs.join("\n");
+    if (key === watchedCommonDirs) {return;}
+    watchedCommonDirs = key;
+
+    for (const w of worktreeWatchers) {
+        w.dispose();
+    }
+    worktreeWatchers = dirs.map((dir) => {
+        const watcher = vscode.workspace.createFileSystemWatcher(
+            new vscode.RelativePattern(vscode.Uri.file(dir), "worktrees/**")
+        );
+        watcher.onDidCreate(scheduleWatcherRefresh);
+        watcher.onDidDelete(scheduleWatcherRefresh);
+        return watcher;
+    });
+    log(`Worktree watchers: watching ${dirs.length} common dir(s)`);
+}
+
+function scheduleWatcherRefresh(): void {
+    if (watcherRefreshTimer) {clearTimeout(watcherRefreshTimer);}
+    watcherRefreshTimer = setTimeout(async () => {
+        watcherRefreshTimer = undefined;
+        repoCache = null;
+        await getRepos(true);
+        worktreeView?.refresh();
+        log(`Worktree watcher: refreshed after git worktree change`);
+    }, 400);
+}
 
 /** fsPath of the pinned anchor folder (globalStorage/anchor), computed sync. */
 function anchorPath(): string | null {
@@ -70,6 +111,313 @@ function refreshActiveFromFolders(): void {
     log(`Active worktree = ${activeWorktreePath ?? "<none>"}`);
     worktreeView?.setActive(activeWorktreePath);
     void updateWindowTitle();
+}
+
+function samePath(a: string, b: string): boolean {
+    const strip = (p: string) => p.replace(/[/\\]+$/, "");
+    return strip(a) === strip(b);
+}
+
+const WARNINGS_DOC_URL =
+    "https://github.com/shindavid/vscode-worktree-continuity/blob/main/docs/warnings.md";
+
+let mixedWarningShown = false;
+let mixedCheckTimer: ReturnType<typeof setTimeout> | undefined;
+
+// >0 while applyTabRemap is mutating tabs, so tab open/close events can be
+// attributed to the extension itself rather than to the user or a language
+// server. A counter (not a bool) because reconcile applies remaps in sequence.
+let applyRemapDepth = 0;
+
+/** The discovered non-bare worktree that contains `fsPath` (longest match), if any. */
+function worktreeOfPath(fsPath: string): { commonDir: string; path: string; label: string } | null {
+    let best: { commonDir: string; path: string; label: string } | null = null;
+    for (const repo of lastKnownRepos) {
+        for (const w of repo.worktrees) {
+            if (w.bare) {continue;}
+            if (relPathUnder(w.path, fsPath) === null) {continue;}
+            if (!best || w.path.length > best.path.length) {
+                best = { commonDir: repo.commonDir, path: w.path, label: worktreeLabel(w) };
+            }
+        }
+    }
+    return best;
+}
+
+/** Open text tabs that belong to a sibling worktree of the active one. */
+function siblingWorktreeTabs(): { path: string; label: string }[] {
+    if (!activeWorktreePath) {return [];}
+    const active = activeWorktreePath;
+    const out: { path: string; label: string }[] = [];
+    for (const group of vscode.window.tabGroups.all) {
+        for (const t of group.tabs) {
+            if (!(t.input instanceof vscode.TabInputText)) {continue;}
+            const p = t.input.uri.fsPath;
+            const wt = worktreeOfPath(p);
+            if (wt && !samePath(wt.path, active)) {
+                out.push({ path: p, label: wt.label });
+            }
+        }
+    }
+    return out;
+}
+
+function hasMixedWorktreeTabs(): boolean {
+    return siblingWorktreeTabs().length > 0;
+}
+
+/** One-line description of a tab: worktree-relative tag + path (for logs). */
+function describeTab(t: vscode.Tab): string {
+    if (!(t.input instanceof vscode.TabInputText)) {return "<non-text tab>";}
+    const uri = t.input.uri;
+    if (uri.scheme !== "file") {return `${uri.scheme}:${uri.fsPath}`;}
+    const p = uri.fsPath;
+    const wt = worktreeOfPath(p);
+    const active = deriveActiveWorktree();
+    const tag = !wt
+        ? "OUTSIDE-any-worktree"
+        : active && samePath(wt.path, active)
+          ? `ACTIVE(${wt.label})`
+          : `SIBLING(${wt.label})`;
+    return `[${tag}] ${p}`;
+}
+
+/**
+ * Log tab open/close events with provenance so we can tell an extension-driven
+ * remap apart from an external open (user navigation such as Go-to-Definition,
+ * or a language server revealing a document). A SIBLING tab opened while we are
+ * NOT remapping is almost always cross-worktree navigation — the exact case the
+ * mixed-worktree warning exists to catch — so it gets an explicit hint.
+ */
+function logTabChanges(e: vscode.TabChangeEvent): void {
+    const origin = applyRemapDepth > 0 ? "self/remap" : "external";
+    for (const t of e.opened) {
+        const desc = describeTab(t);
+        const hint =
+            applyRemapDepth === 0 && desc.startsWith("[SIBLING")
+                ? " (likely cross-worktree navigation)"
+                : "";
+        log(`Tab opened (${origin}): ${desc}${hint}`);
+    }
+    for (const t of e.closed) {
+        log(`Tab closed (${origin}): ${describeTab(t)}`);
+    }
+}
+
+/** Log a full snapshot of state for diagnosing worktree/language-server issues. */
+function dumpDebugState(reason: string): void {
+    log(`===== debug dump (${reason}) =====`);
+    log(`anchorPath = ${anchorPath() ?? "<none>"}`);
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    log(`workspace folders (${folders.length}):`);
+    folders.forEach((f, i) => log(`  [${i}] "${f.name}" = ${f.uri.fsPath}`));
+    const active = deriveActiveWorktree();
+    log(`activeWorktreePath(var) = ${activeWorktreePath ?? "<none>"}`);
+    log(`deriveActiveWorktree()  = ${active ?? "<none>"}`);
+    log(`discovered repos (${lastKnownRepos.length}):`);
+    for (const repo of lastKnownRepos) {
+        log(`  repo ${repo.commonDir} "${repo.name}":`);
+        for (const w of repo.worktrees) {
+            const tag = active && samePath(w.path, active) ? " <ACTIVE>" : "";
+            log(`    - [${worktreeLabel(w)}] ${w.path}${w.bare ? " (bare)" : ""}${tag}`);
+        }
+    }
+    log(`open text tabs:`);
+    for (const group of vscode.window.tabGroups.all) {
+        for (const t of group.tabs) {
+            if (!(t.input instanceof vscode.TabInputText)) {
+                log(`  col${group.viewColumn}   <non-text tab>`);
+                continue;
+            }
+            const p = t.input.uri.fsPath;
+            const wt = worktreeOfPath(p);
+            let tag = "OUTSIDE-any-worktree";
+            if (wt) {
+                tag = active && samePath(wt.path, active) ? `ACTIVE(${wt.label})` : `SIBLING(${wt.label})`;
+            }
+            log(`  col${group.viewColumn}${t.isActive ? " *" : "  "} [${tag}] ${p}`);
+        }
+    }
+    log(`===== end debug dump =====`);
+    outputChannel?.show(true);
+}
+
+/**
+ * Debounced check for tabs from another worktree. Having them open lets a shared
+ * language server (e.g. clangd) load the other worktree's project and resolve
+ * symbols to the wrong copy. Warn once per episode, with a one-click fix.
+ */
+function scheduleMixedWorktreeCheck(): void {
+    if (mixedCheckTimer) {clearTimeout(mixedCheckTimer);}
+    mixedCheckTimer = setTimeout(async () => {
+        mixedCheckTimer = undefined;
+        const siblings = siblingWorktreeTabs();
+        if (siblings.length === 0) {
+            mixedWarningShown = false;
+            return;
+        }
+        log(
+            `Mixed-worktree tabs detected (${siblings.length}): ` +
+                siblings.map((s) => `[${s.label}] ${s.path}`).join(" | ")
+        );
+        if (mixedWarningShown) {return;}
+        mixedWarningShown = true;
+        const choice = await vscode.window.showWarningMessage(
+            "Worktree Continuity: files from another worktree are open. This can confuse " +
+                "language servers — e.g. Go to Definition may jump to the wrong worktree's copy.",
+            "Reconcile",
+            "Learn more"
+        );
+        if (choice === "Reconcile") {
+            const repos = await getRepos();
+            const remapped = await reconcileOpenTabs(repos);
+            if (remapped > 0) {scheduleLanguageServerRestart();}
+        } else if (choice === "Learn more") {
+            void vscode.env.openExternal(vscode.Uri.parse(WARNINGS_DOC_URL));
+        }
+    }, 1000);
+}
+
+/**
+ * On workspace open, VS Code restores editor tabs by absolute path, which can
+ * leave tabs pointing at a sibling worktree that isn't the active one (e.g. a
+ * tab left over from a previous session). Remap any such tab to the equivalent
+ * file in the active worktree so the open editors match what's focused. Unlike a
+ * switch, this never closes tabs that have no equivalent — it only remaps the
+ * ones it can, so nothing is lost on startup.
+ */
+async function reconcileOpenTabs(repos: RepoSnapshot[]): Promise<number> {
+    const carryTabs = vscode.workspace
+        .getConfiguration()
+        .get<boolean>("worktree-continuity.carryTabs", true);
+    if (!carryTabs || !activeWorktreePath) {return 0;}
+    const active = activeWorktreePath;
+
+    const repo = repos.find((r) => r.worktrees.some((w) => !w.bare && samePath(w.path, active)));
+    if (!repo) {return 0;}
+    const siblings = repo.worktrees
+        .filter((w) => !w.bare && !samePath(w.path, active))
+        .map((w) => w.path);
+
+    let remapped = 0;
+    for (const sibling of siblings) {
+        try {
+            const { plan, tabByKey } = await buildTabRemapPlan(sibling, active, (rel) =>
+                positionCache?.get(repo.commonDir, rel)
+            );
+            if (plan.reopen.length === 0) {continue;}
+            // Only remap tabs that have an equivalent; leave orphan tabs open.
+            const remapOnly: TabRemapPlan = { reopen: plan.reopen, closeMissing: [], skipDirty: [] };
+            log(`Reconcile on open: ${sibling} → ${active} (remap ${plan.reopen.length} tab(s))`);
+            await applyTabRemap(remapOnly, tabByKey, positionCache ?? undefined);
+            remapped += plan.reopen.length;
+        } catch (e) {
+            log(`Reconcile failed for ${sibling}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    }
+    return remapped;
+}
+
+let lsRestartTimer: ReturnType<typeof setTimeout> | undefined;
+let lastLsRestartAt = 0;
+
+// Fire quickly after a switch (small window where the language server still has
+// the old worktree's index), but never within MIN_GAP of a previous restart —
+// restarting while a language server is still starting up double-registers its
+// commands and errors ("command 'clangd.applyFix' already exists").
+const LS_RESTART_DEBOUNCE_MS = 400;
+const LS_RESTART_MIN_GAP_MS = 4000;
+
+/**
+ * Schedule a debounced language-server re-scope. Many servers (clangd included)
+ * keep the previous worktree's index across a folder swap, so after a switch we
+ * restart them to force a clean re-scope. Rapid triggers coalesce into one, and
+ * a minimum gap keeps a restart from racing an in-flight startup.
+ */
+function scheduleLanguageServerRestart(): void {
+    if (lsRestartTimer) {clearTimeout(lsRestartTimer);}
+    const sinceLast = Date.now() - lastLsRestartAt;
+    const delay = Math.max(LS_RESTART_DEBOUNCE_MS, LS_RESTART_MIN_GAP_MS - sinceLast);
+    lsRestartTimer = setTimeout(() => {
+        lsRestartTimer = undefined;
+        lastLsRestartAt = Date.now();
+        void restartLanguageServers();
+    }, delay);
+}
+
+/**
+ * Dump the state that decides where a shared C/C++ language server resolves
+ * symbols, so we can see *why* Go-to-Definition lands in the wrong worktree
+ * after a switch. clangd keys its project on the nearest compilation database
+ * (compile_commands.json / compile_flags.txt / .clangd) and a persisted index
+ * under `.cache/clangd`; if the active worktree lacks one — or clangd was
+ * launched with a `--compile-commands-dir` pinned at another worktree — it will
+ * keep resolving against the original (e.g. `main`) copy even after a restart.
+ */
+async function logLanguageServerScope(): Promise<void> {
+    const anchor = anchorPath();
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    log(`LS scope: workspace folders (${folders.length}):`);
+    folders.forEach((f, i) => {
+        const tag = f.uri.fsPath === anchor ? " (anchor)" : "";
+        log(`LS scope:   [${i}] "${f.name}" = ${f.uri.fsPath}${tag}`);
+    });
+    const active = deriveActiveWorktree();
+    log(`LS scope: active worktree = ${active ?? "<none>"}`);
+
+    // Compilation-database / index markers that clangd keys its project on.
+    const markers = [
+        "compile_commands.json",
+        "compile_flags.txt",
+        ".clangd",
+        "build/compile_commands.json",
+        ".cache/clangd",
+    ];
+    const roots = new Set<string>();
+    if (active) {roots.add(active);}
+    for (const f of folders) {
+        if (f.uri.fsPath !== anchor) {roots.add(f.uri.fsPath);}
+    }
+    for (const root of roots) {
+        const present = (
+            await Promise.all(
+                markers.map(async (m) => ((await pathExists(path.join(root, m))) ? m : null))
+            )
+        ).filter((m): m is string => m !== null);
+        log(`LS scope:   ${root} → ${present.length ? present.join(", ") : "<no clangd project markers>"}`);
+    }
+
+    // A pinned --compile-commands-dir (or a fixed clangd.path) overrides the
+    // workspace root entirely and is a prime suspect for wrong-worktree resolution.
+    const clangdCfg = vscode.workspace.getConfiguration("clangd");
+    const clangdArgs = clangdCfg.get<string[]>("arguments", []) ?? [];
+    const pinned = clangdArgs.filter((a) => /--compile-commands-dir|--index-file|--path-mappings/.test(a));
+    if (pinned.length > 0) {
+        log(`LS scope: clangd.arguments pins: ${pinned.join(" ")}`);
+    } else if (clangdArgs.length > 0) {
+        log(`LS scope: clangd.arguments = ${clangdArgs.join(" ")}`);
+    }
+}
+
+async function restartLanguageServers(): Promise<void> {
+    const commands = vscode.workspace
+        .getConfiguration()
+        .get<string[]>("worktree-continuity.languageServerRestartCommands", []);
+    if (!commands || commands.length === 0) {return;}
+    await logLanguageServerScope();
+    const available = new Set(await vscode.commands.getCommands(true));
+    for (const command of commands) {
+        if (!available.has(command)) {
+            log(`LS restart: command not present, skipping: ${command}`);
+            continue;
+        }
+        try {
+            await vscode.commands.executeCommand(command);
+            log(`LS restart: ran ${command}`);
+        } catch (e) {
+            log(`LS restart: ${command} failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+    }
 }
 
 /**
@@ -147,17 +495,35 @@ export function activate(context: vscode.ExtensionContext) {
             if (!outputChannel) {outputChannel = vscode.window.createOutputChannel("Worktree Continuity");}
             outputChannel.show();
         }),
+        vscode.commands.registerCommand("worktree-continuity.debugDump", () => dumpDebugState("manual")),
         vscode.workspace.onDidChangeWorkspaceFolders(async () => {
             log(`Workspace folders changed`);
             repoCache = null;
             refreshActiveFromFolders();
             await getRepos(true);
+            // clangd does NOT re-scope on a folder[1] swap — it keeps the old
+            // worktree's index, so Go to Definition resolves shared symbols to
+            // the wrong worktree. Restart it (debounced, so it can't race a
+            // language-server startup and double-register commands).
+            scheduleLanguageServerRestart();
         }),
         // Position-cache feeders. These run continuously so background tabs
         // (which have no live TextEditor at switch time) still have a recorded
         // position to restore.
         vscode.window.onDidChangeActiveTextEditor((editor) => {
-            if (editor) {recordEditorPosition(editor, true);}
+            if (editor) {
+                recordEditorPosition(editor, true);
+                if (editor.document.uri.scheme === "file") {
+                    const active = deriveActiveWorktree();
+                    const wt = worktreeOfPath(editor.document.uri.fsPath);
+                    const tag = !wt
+                        ? "OUTSIDE-any-worktree"
+                        : active && samePath(wt.path, active)
+                          ? `ACTIVE(${wt.label})`
+                          : `SIBLING(${wt.label})`;
+                    log(`Active editor focus → [${tag}] ${editor.document.uri.fsPath}`);
+                }
+            }
         }),
         vscode.window.onDidChangeTextEditorSelection((e) => {
             recordEditorPosition(e.textEditor, false);
@@ -165,13 +531,30 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.onDidChangeTextEditorVisibleRanges((e) => {
             recordEditorTopLine(e.textEditor);
         }),
+        // Warn (with a one-click fix) if tabs from another worktree get opened,
+        // which can make a shared language server resolve symbols to the wrong copy.
+        vscode.window.tabGroups.onDidChangeTabs((e) => {
+            logTabChanges(e);
+            scheduleMixedWorktreeCheck();
+        }),
         { dispose: () => positionCache?.dispose() }
     );
 
     setTimeout(async () => {
         try {
-            await getRepos();
+            // Establish the anchor layout now (folding its one-time restart into
+            // the initial load) so the first switch is instant. If it fires, a
+            // restart is imminent — the reactivated host will run the rest.
+            if (await ensureAnchoredLayout()) {return;}
+            const repos = await getRepos();
             worktreeView?.refresh();
+            const remapped = await reconcileOpenTabs(repos);
+            // If we had to close stray sibling-worktree tabs, re-scope the language
+            // server(s): clangd may have already loaded the other worktree's
+            // project from those tabs, and a restart now (with them gone) drops it.
+            if (remapped > 0) {
+                scheduleLanguageServerRestart();
+            }
             await updateWindowTitle();
         } catch (e) {
             log(`Pre-warm failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -180,6 +563,10 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
+    for (const w of worktreeWatchers) {
+        w.dispose();
+    }
+    worktreeWatchers = [];
     positionCache?.dispose();
     try {
         void vscode.workspace
@@ -355,6 +742,7 @@ export async function applyTabRemap(
     tabByKey: Map<string, vscode.Tab>,
     cache?: { suspend(): void; resume(): void }
 ): Promise<void> {
+    applyRemapDepth++;
     cache?.suspend();
     try {
         // Close the tabs we're going to reopen and the ones with no target.
@@ -368,9 +756,11 @@ export async function applyTabRemap(
             await vscode.window.tabGroups.close(toClose, true);
         }
 
-        // Reopen per column: background tabs first (each materializes and
-        // captures its cached position), the group's active tab last. The one
-        // globally-focused tab is opened at the very end without preserveFocus.
+        // Reopen per column in the ORIGINAL tab order (so the tab strip order is
+        // preserved), each materializing to apply its cached position. After a
+        // column's tabs are all open, re-show its active tab to bring it to the
+        // foreground in place (without moving it). Finally, focus the globally
+        // active tab.
         const byColumn = new Map<number, ReopenAction[]>();
         for (const a of plan.reopen) {
             const arr = byColumn.get(a.viewColumn) ?? [];
@@ -380,12 +770,15 @@ export async function applyTabRemap(
 
         let focusAction: ReopenAction | undefined;
         for (const [, actions] of byColumn) {
-            for (const a of orderColumnReopens(actions)) {
-                if (a.focusGlobally) {
-                    focusAction = a;
-                    continue; // opened last, below
-                }
+            const ordered = orderColumnReopens(actions);
+            for (const a of ordered) {
                 await openReopenAction(a, true);
+            }
+            const active = ordered.find((a) => a.makeActiveInGroup);
+            if (active) {
+                // Re-reveal the active tab in place (already open → not reordered).
+                await openReopenAction(active, true);
+                if (active.focusGlobally) {focusAction = active;}
             }
         }
         if (focusAction) {
@@ -393,6 +786,7 @@ export async function applyTabRemap(
         }
     } finally {
         cache?.resume();
+        applyRemapDepth--;
     }
 }
 
@@ -484,6 +878,47 @@ async function ensureAnchorDir(): Promise<string | null> {
         return null;
     }
     return anchor.fsPath;
+}
+
+/**
+ * If a single git worktree is open as the workspace (not yet the anchor layout),
+ * establish [anchor, worktree] now — on open — instead of deferring it to the
+ * first switch. This is the one setup that changes folder[0] and restarts the
+ * extension host; doing it during the initial load means every later switch is a
+ * restart-free folder[1] swap. Returns true if it triggered the setup (a restart
+ * is imminent, so callers should stop).
+ */
+async function ensureAnchoredLayout(): Promise<boolean> {
+    const enabled = vscode.workspace
+        .getConfiguration()
+        .get<boolean>("worktree-continuity.anchorOnOpen", true);
+    if (!enabled) {return false;}
+
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    // Only auto-anchor a plain single-folder workspace; never disturb an
+    // existing anchor layout or a user's own multi-root workspace.
+    if (folders.length !== 1) {return false;}
+    const worktree = folders[0].uri.fsPath;
+    if (worktree === anchorPath()) {return false;}
+
+    // Only anchor if the folder really is a git worktree.
+    try {
+        await getGitCommonDir(worktree);
+    } catch {
+        return false;
+    }
+
+    const anchor = await ensureAnchorDir();
+    if (!anchor) {return false;}
+
+    log(`Anchoring workspace on open: [anchor, ${worktree}] (one-time restart)`);
+    vscode.workspace.updateWorkspaceFolders(
+        0,
+        folders.length,
+        { uri: vscode.Uri.file(anchor), name: ANCHOR_FOLDER_NAME },
+        { uri: vscode.Uri.file(worktree), name: path.basename(worktree) }
+    );
+    return true;
 }
 
 /**
@@ -713,6 +1148,7 @@ async function getRepos(forceRefresh = false): Promise<RepoSnapshot[]> {
         lastKnownRepos = repos;
         worktreeView?.setRepos(repos);
         persistRepos(repos);
+        updateWorktreeWatchers(repos);
     }
     return repos;
 }
@@ -738,7 +1174,10 @@ async function refreshCommand(): Promise<void> {
 }
 
 async function discoverReposFromWorkspace(): Promise<RepoSnapshot[]> {
-    const folders = vscode.workspace.workspaceFolders ?? [];
+    const anchor = anchorPath();
+    const folders = (vscode.workspace.workspaceFolders ?? []).filter(
+        (f) => f.uri.fsPath !== anchor
+    );
     const t0 = Date.now();
     log(`Discovery: scanning ${folders.length} workspace folder(s) (maxDepth=${REPO_DISCOVERY_MAX_DEPTH})`);
 

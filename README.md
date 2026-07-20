@@ -23,10 +23,15 @@ the `[anchor, worktree]` layout and therefore changes folder[0] once. From then
 on, switches are restart-free.
 
 Because each worktree is its own workspace folder (at its own absolute path),
-**language servers scope to the active worktree** — including clangd, which
-resolves each file against the nearest `compile_commands.json`, and Pylance,
-which re-scopes on the folder change. Go-to-definition lands in the worktree
-you're actually editing.
+**language servers scope to the active worktree** — clangd resolves each file
+against the nearest `compile_commands.json`, and so on. However, many language
+servers (clangd included) **keep the previous worktree's index in memory across
+a folder swap**, which would make Go to Definition resolve a shared symbol to the
+wrong worktree's copy. So on switch the extension **restarts the relevant
+language servers** (debounced) to force a clean re-scope — see
+`languageServerRestartCommands` below. This restarts the language server, not the
+extension host, so Claude Code and other state are untouched; the cost is a brief
+re-index after each switch.
 
 ## The Worktrees view
 
@@ -94,6 +99,15 @@ working directory, which doesn't track the active worktree.
 - `worktree-continuity.carryTabs` (default `true`) — carry tabs on switch.
 - `worktree-continuity.persistPositionsAcrossRestart` (default `true`) — persist
   the position cache in `globalState`.
+- `worktree-continuity.anchorOnOpen` (default `true`) — establish the anchor
+  layout on open (folding the one-time setup restart into the initial load) so
+  the first switch is instant.
+- `worktree-continuity.languageServerRestartCommands` — command IDs run
+  (debounced) to re-scope language servers to the active worktree after a switch.
+  Default covers clangd, Pylance, gopls, rust-analyzer, and tsserver; only
+  commands that are actually registered run, so add your server's restart command
+  if it isn't listed, or set `[]` to disable. (There's no VS Code API to
+  enumerate language servers, so this list is curated.)
 - `workbench.colorCustomizations` → `worktreeContinuity.currentWorktreeForeground`
   overrides the green used for the current worktree.
 

@@ -151,17 +151,11 @@ export function planTabRemap(input: PlanInput): TabRemapPlan {
 }
 
 /**
- * Order the reopen actions of a single view column so that background tabs are
- * materialized first (each briefly becomes the column's active editor and
- * captures its cached position/scroll) and the group's active tab is opened
- * last, ending up in the foreground. Within the background set, original
- * left-to-right tab order is preserved.
+ * Order the reopen actions of a single view column by their original
+ * left-to-right tab position, so reopening preserves the tab strip order. The
+ * caller re-focuses the group's active tab afterwards (re-showing an already
+ * open tab focuses it without moving it), which keeps both order and focus.
  */
 export function orderColumnReopens(actions: ReopenAction[]): ReopenAction[] {
-    return [...actions].sort((a, b) => {
-        if (a.makeActiveInGroup !== b.makeActiveInGroup) {
-            return a.makeActiveInGroup ? 1 : -1; // active tab goes last
-        }
-        return a.tabIndex - b.tabIndex;
-    });
+    return [...actions].sort((a, b) => a.tabIndex - b.tabIndex);
 }

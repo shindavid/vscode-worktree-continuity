@@ -7,3 +7,6 @@ tests/**/*.js
 tests/**/*.js.map
 vitest.config.js
 vitest.config.js.map
+
+# local debug logs
+log*.txt

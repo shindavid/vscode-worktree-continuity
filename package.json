@@ -84,6 +84,10 @@
         "title": "Worktree Continuity: Show Logs"
       },
       {
+        "command": "worktree-continuity.debugDump",
+        "title": "Worktree Continuity: Debug Dump (log state)"
+      },
+      {
         "command": "worktree-continuity.switchToWorktree",
         "title": "Switch to Worktree"
       }
@@ -119,6 +123,25 @@
           "type": "boolean",
           "default": true,
           "description": "Persist cached cursor/scroll positions in globalState so they survive VS Code restarts (not just in-session)."
+        },
+        "worktree-continuity.anchorOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a single git worktree is opened as the workspace, establish the anchor layout immediately on open (a one-time extension-host restart). This moves the unavoidable setup restart into the initial load, so the first worktree switch is instantaneous. Disable to defer setup until the first switch instead."
+        },
+        "worktree-continuity.languageServerRestartCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "clangd.restart",
+            "python.analysis.restartLanguageServer",
+            "go.languageserver.restart",
+            "rust-analyzer.restartServer",
+            "typescript.restartTsServer"
+          ],
+          "markdownDescription": "Command IDs to run (debounced) to re-scope language servers to the active worktree after a switch or after reconciling stray tabs. Many language servers keep the previous worktree's index across a folder swap, so without this, Go to Definition can resolve a shared symbol (e.g. a function declared in a header) to the wrong worktree's copy.\n\nThe default covers common servers (clangd, Pylance, gopls, rust-analyzer, tsserver); **commands that aren't registered are skipped**, so only your installed servers are actually restarted. Add your own language server's restart command here if it isn't listed. Set to `[]` to disable. There is no VS Code API to enumerate language servers, so this list is necessarily curated."
         }
       }
     }
