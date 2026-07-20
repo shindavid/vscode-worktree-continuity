@@ -283,22 +283,23 @@ export function partitionReopensByLoad(
 
 export type GroupReopenOrder = {
     viewColumn: number;
-    /** Reopens for this column, non-visible first (by tabIndex), then the
-     * previously-visible one (makeActiveInGroup) LAST so it ends up revealed. */
+    /** Reopens for this column in ORIGINAL tab-index order — so opening them in
+     * this sequence reproduces the pre-remap relative order. (Earlier revisions
+     * put the visible tab last, which displaced it; that's the log6 regression.) */
     ordered: ReopenAction[];
-    /** True if this column's previously-visible tab was itself a remapped stray
-     * (so `ordered` ends with its replacement). False means the column's visible
-     * tab was NOT a stray — the caller must re-show that original visible tab last
-     * so a background open doesn't leave the wrong tab showing. */
-    hasVisibleReopen: boolean;
+    /** The reopen whose source tab was this group's previously-visible (active)
+     * tab, if that tab was itself a remapped stray. The caller reveals it (already
+     * open → no move) so the group shows the right tab; undefined means the
+     * group's visible tab was NOT a stray and must be restored from live state. */
+    visible: ReopenAction | undefined;
 };
 
 /**
- * Group reopen actions by view column and order each column so its final-visible
- * tab is opened LAST. `showTextDocument` always reveals in its group, so opening
- * a column's previously-visible replacement last leaves that column showing the
- * right tab (fixing the non-focused-group fidelity regression), while everything
- * before it can open in the background. Columns are returned in ascending order.
+ * Group reopen actions by view column, each column in ORIGINAL tab-index order,
+ * plus the previously-visible reopen for that column. Opening a column's reopens
+ * in `ordered` reproduces the original relative order; the caller separately
+ * reveals `visible` (an already-open re-show reveals without moving) so the group
+ * ends showing the right tab without reordering. Columns ascending.
  */
 export function orderReopensByGroup(reopens: ReopenAction[]): GroupReopenOrder[] {
     const byCol = new Map<number, ReopenAction[]>();
@@ -311,13 +312,11 @@ export function orderReopensByGroup(reopens: ReopenAction[]): GroupReopenOrder[]
         .sort((a, b) => a - b)
         .map((viewColumn) => {
             const actions = byCol.get(viewColumn) ?? [];
-            const byIndex = (a: ReopenAction, b: ReopenAction): number => a.tabIndex - b.tabIndex;
-            const nonVisible = actions.filter((a) => !a.makeActiveInGroup).sort(byIndex);
-            const visible = actions.filter((a) => a.makeActiveInGroup).sort(byIndex);
+            const ordered = [...actions].sort((a, b) => a.tabIndex - b.tabIndex);
             return {
                 viewColumn,
-                ordered: [...nonVisible, ...visible],
-                hasVisibleReopen: visible.length > 0,
+                ordered,
+                visible: ordered.find((a) => a.makeActiveInGroup),
             };
         });
 }

@@ -214,8 +214,8 @@ describe("orderColumnReopens", () => {
     });
 });
 
-describe("orderReopensByGroup (per-group visible-last ordering)", () => {
-    it("puts a group's previously-visible (active) stray replacement LAST", () => {
+describe("orderReopensByGroup (original order + visible metadata)", () => {
+    it("orders each group by ORIGINAL tab index (not visible-last) and exposes the visible reopen", () => {
         const groups = orderReopensByGroup([
             reopen({ relPath: "second", viewColumn: 1, tabIndex: 1 }),
             reopen({ relPath: "active", viewColumn: 1, tabIndex: 0, makeActiveInGroup: true }),
@@ -223,30 +223,32 @@ describe("orderReopensByGroup (per-group visible-last ordering)", () => {
         ]);
         expect(groups).toHaveLength(1);
         expect(groups[0].viewColumn).toBe(1);
-        expect(groups[0].hasVisibleReopen).toBe(true);
-        // non-visible by tabIndex, then the visible one last (despite tabIndex 0).
-        expect(groups[0].ordered.map((a) => a.relPath)).toEqual(["second", "third", "active"]);
+        // ORIGINAL order: the visible (active) tab stays at its index-0 slot.
+        expect(groups[0].ordered.map((a) => a.relPath)).toEqual(["active", "second", "third"]);
+        expect(groups[0].visible?.relPath).toBe("active");
     });
 
-    it("flags a group whose visible tab was NOT a stray (only strays reopened)", () => {
+    it("leaves visible undefined when the group's visible tab was NOT a stray", () => {
         const groups = orderReopensByGroup([
             reopen({ relPath: "b", viewColumn: 1, tabIndex: 2 }),
             reopen({ relPath: "a", viewColumn: 1, tabIndex: 1 }),
         ]);
-        expect(groups[0].hasVisibleReopen).toBe(false);
+        expect(groups[0].visible).toBeUndefined();
         expect(groups[0].ordered.map((a) => a.relPath)).toEqual(["a", "b"]);
     });
 
-    it("returns columns in ascending order, each ordered visible-last", () => {
+    it("returns columns in ascending order, each in original tab-index order", () => {
         const groups = orderReopensByGroup([
-            reopen({ relPath: "c2-active", viewColumn: 2, tabIndex: 0, makeActiveInGroup: true }),
-            reopen({ relPath: "c2-x", viewColumn: 2, tabIndex: 1 }),
-            reopen({ relPath: "c1-active", viewColumn: 1, tabIndex: 1, makeActiveInGroup: true }),
-            reopen({ relPath: "c1-x", viewColumn: 1, tabIndex: 0 }),
+            reopen({ relPath: "c2-active", viewColumn: 2, tabIndex: 1, makeActiveInGroup: true }),
+            reopen({ relPath: "c2-x", viewColumn: 2, tabIndex: 0 }),
+            reopen({ relPath: "c1-active", viewColumn: 1, tabIndex: 0, makeActiveInGroup: true }),
+            reopen({ relPath: "c1-x", viewColumn: 1, tabIndex: 1 }),
         ]);
         expect(groups.map((g) => g.viewColumn)).toEqual([1, 2]);
-        expect(groups[0].ordered.map((a) => a.relPath)).toEqual(["c1-x", "c1-active"]);
+        expect(groups[0].ordered.map((a) => a.relPath)).toEqual(["c1-active", "c1-x"]);
+        expect(groups[0].visible?.relPath).toBe("c1-active");
         expect(groups[1].ordered.map((a) => a.relPath)).toEqual(["c2-x", "c2-active"]);
+        expect(groups[1].visible?.relPath).toBe("c2-active");
     });
 
     it("omits columns that have no reopens", () => {

@@ -29,6 +29,23 @@ function isOpen(fsPath: string): boolean {
     );
 }
 
+/** fsPaths of the text tabs in a view column, left-to-right. */
+function tabsInColumn(col: vscode.ViewColumn): string[] {
+    const g = vscode.window.tabGroups.all.find((gr) => gr.viewColumn === col);
+    return (g?.tabs ?? [])
+        .filter((t): t is vscode.Tab & { input: vscode.TabInputText } =>
+            t.input instanceof vscode.TabInputText
+        )
+        .map((t) => t.input.uri.fsPath);
+}
+
+/** fsPath of a column's visible (active) tab. */
+function visibleInColumn(col: vscode.ViewColumn): string | undefined {
+    const g = vscode.window.tabGroups.all.find((gr) => gr.viewColumn === col);
+    const t = g?.activeTab;
+    return t?.input instanceof vscode.TabInputText ? t.input.uri.fsPath : undefined;
+}
+
 // Key format must match extension.ts's internal `tabKey()` exactly — it joins
 // viewColumn and fsPath with a NUL byte (not a space) specifically so a path
 // can never collide with the separator. applyTabRemap looks up tabs to close
@@ -57,9 +74,9 @@ suite("tab carry (integration)", () => {
         bRoot = path.join(dir, "wt-b");
         for (const root of [aRoot, bRoot]) {
             fs.mkdirSync(path.join(root, "src"), { recursive: true });
-            fs.writeFileSync(path.join(root, "src", "foo.ts"), FILE_BODY);
-            fs.writeFileSync(path.join(root, "src", "bar.ts"), FILE_BODY);
-            fs.writeFileSync(path.join(root, "src", "baz.ts"), FILE_BODY);
+            for (const name of ["foo.ts", "bar.ts", "baz.ts", "qux.ts"]) {
+                fs.writeFileSync(path.join(root, "src", name), FILE_BODY);
+            }
         }
         // A file that only exists in A (no equivalent in B).
         fs.writeFileSync(path.join(aRoot, "src", "only-in-a.ts"), FILE_BODY);
@@ -129,33 +146,41 @@ suite("tab carry (integration)", () => {
         assert.strictEqual(isOpen(aFoo), false, "old-worktree tab should be closed");
     });
 
-    test("batched remap of multiple tabs leaves the previously-active stray's equivalent focused", async () => {
-        const aFoo = path.join(aRoot, "src", "foo.ts");
-        const aBar = path.join(aRoot, "src", "bar.ts");
-        const aBaz = path.join(aRoot, "src", "baz.ts");
-        const bBar = path.join(bRoot, "src", "bar.ts");
-        // Open three A tabs; make the MIDDLE one (bar.ts) the active one.
-        await vscode.window.showTextDocument(vscode.Uri.file(aFoo), { preview: false });
-        await vscode.window.showTextDocument(vscode.Uri.file(aBaz), { preview: false });
-        await vscode.window.showTextDocument(vscode.Uri.file(aBar), { preview: false });
-        await waitUntil(() => isOpen(aFoo) && isOpen(aBar) && isOpen(aBaz));
-        await waitUntil(() => vscode.window.activeTextEditor?.document.uri.fsPath === aBar);
+    test("single-group remap preserves tab order; active tab stays at its index (log6 repro)", async () => {
+        const col = vscode.ViewColumn.One;
+        // A,B,C,D all strays in one group; make C (index 2) the active tab.
+        const [aFoo, aBar, aBaz, aQux] = ["foo", "bar", "baz", "qux"].map((n) =>
+            path.join(aRoot, "src", `${n}.ts`)
+        );
+        const [bFoo, bBar, bBaz, bQux] = ["foo", "bar", "baz", "qux"].map((n) =>
+            path.join(bRoot, "src", `${n}.ts`)
+        );
+        for (const p of [aFoo, aBar, aBaz, aQux]) {
+            await vscode.window.showTextDocument(vscode.Uri.file(p), { viewColumn: col, preview: false });
+        }
+        await waitUntil(() => [aFoo, aBar, aBaz, aQux].every(isOpen));
+        // Focus C (baz, index 2) — NOT the last-opened tab.
+        await vscode.window.showTextDocument(vscode.Uri.file(aBaz), { viewColumn: col, preview: false });
+        await waitUntil(() => visibleInColumn(col) === aBaz);
+        assert.deepStrictEqual(tabsInColumn(col), [aFoo, aBar, aBaz, aQux], "fixture order A,B,C,D");
 
         const { plan, tabByKey } = await buildTabRemapPlan(aRoot, bRoot, () => undefined);
         await applyTabRemap(plan, tabByKey);
 
-        // Single-focus outcome: the equivalent of the previously-active stray is
-        // the final active editor, and all three A tabs are gone.
-        await waitUntil(() => vscode.window.activeTextEditor?.document.uri.fsPath === bBar);
-        assert.strictEqual(
-            vscode.window.activeTextEditor!.document.uri.fsPath,
-            bBar,
-            "equivalent of the previously-active stray (bar.ts) is focused"
+        // Order preserved AND the active tab's replacement stays at index 2 (not
+        // promoted to index 0 as in the log6 regression), and it is focused.
+        await waitUntil(() => tabsInColumn(col).length === 4 && !isOpen(aFoo));
+        assert.deepStrictEqual(
+            tabsInColumn(col),
+            [bFoo, bBar, bBaz, bQux],
+            "original relative order preserved after remap"
         );
-        await waitUntil(() => !isOpen(aFoo) && !isOpen(aBar) && !isOpen(aBaz));
-        assert.strictEqual(isOpen(aFoo), false, "stray foo.ts closed");
-        assert.strictEqual(isOpen(aBar), false, "stray bar.ts closed");
-        assert.strictEqual(isOpen(aBaz), false, "stray baz.ts closed");
+        assert.strictEqual(tabsInColumn(col)[2], bBaz, "active tab's replacement stayed at index 2");
+        assert.strictEqual(
+            vscode.window.activeTextEditor?.document.uri.fsPath,
+            bBaz,
+            "the active tab's replacement is focused"
+        );
     });
 
     test("when the active tab is not a stray, focus never moves during the remap", async () => {
@@ -188,68 +213,54 @@ suite("tab carry (integration)", () => {
         );
     });
 
-    test("multi-column remap: each group ends showing its correct tab, focus on the active group", async () => {
-        const aFoo = path.join(aRoot, "src", "foo.ts"); // col 1, will be globally active
+    test("multi-column remap: each group keeps its original order + visible tab; one focus move", async () => {
+        const one = vscode.ViewColumn.One;
+        const two = vscode.ViewColumn.Two;
+        const aFoo = path.join(aRoot, "src", "foo.ts"); // col 1, globally active
         const bFoo = path.join(bRoot, "src", "foo.ts");
-        const aBar = path.join(aRoot, "src", "bar.ts"); // col 2 stray (not visible there)
-        const bBar = path.join(bRoot, "src", "bar.ts");
-        const outside = path.join(dir, "outside2.ts"); // col 2 visible, NOT a stray
-        fs.writeFileSync(outside, FILE_BODY);
+        // col 2: three strays [bar, baz, qux], with baz (index 1) the visible one.
+        const [aBar, aBaz, aQux] = ["bar", "baz", "qux"].map((n) => path.join(aRoot, "src", `${n}.ts`));
+        const [bBar, bBaz, bQux] = ["bar", "baz", "qux"].map((n) => path.join(bRoot, "src", `${n}.ts`));
 
-        const groupActiveUri = (col: vscode.ViewColumn): string | undefined => {
-            const g = vscode.window.tabGroups.all.find((gr) => gr.viewColumn === col);
-            const t = g?.activeTab;
-            return t?.input instanceof vscode.TabInputText ? t.input.uri.fsPath : undefined;
-        };
-
-        // Column 2: a stray (bar) then a non-stray visible tab (outside).
-        await vscode.window.showTextDocument(vscode.Uri.file(aBar), {
-            viewColumn: vscode.ViewColumn.Two,
-            preview: false,
-        });
-        await vscode.window.showTextDocument(vscode.Uri.file(outside), {
-            viewColumn: vscode.ViewColumn.Two,
-            preview: false,
-        });
-        // Column 1: a stray (foo), made the globally-active tab.
-        await vscode.window.showTextDocument(vscode.Uri.file(aFoo), {
-            viewColumn: vscode.ViewColumn.One,
-            preview: false,
-        });
-        await waitUntil(() => isOpen(aFoo) && isOpen(aBar) && isOpen(outside));
-        await waitUntil(() => groupActiveUri(vscode.ViewColumn.One) === aFoo);
-        await waitUntil(() => groupActiveUri(vscode.ViewColumn.Two) === outside);
+        for (const p of [aBar, aBaz, aQux]) {
+            await vscode.window.showTextDocument(vscode.Uri.file(p), { viewColumn: two, preview: false });
+        }
+        // Make baz (index 1) the visible tab of col 2.
+        await vscode.window.showTextDocument(vscode.Uri.file(aBaz), { viewColumn: two, preview: false });
+        // col 1: foo, made the globally-active tab.
+        await vscode.window.showTextDocument(vscode.Uri.file(aFoo), { viewColumn: one, preview: false });
+        await waitUntil(() => [aFoo, aBar, aBaz, aQux].every(isOpen));
+        await waitUntil(() => visibleInColumn(one) === aFoo && visibleInColumn(two) === aBaz);
+        assert.deepStrictEqual(tabsInColumn(two), [aBar, aBaz, aQux], "col 2 fixture order");
 
         const { plan, tabByKey } = await buildTabRemapPlan(aRoot, bRoot, () => undefined);
-
-        // Track keyboard-focus landings: only the active-group settle should end
-        // on col 1. We assert the FINAL active editor is col 1's replacement.
         await applyTabRemap(plan, tabByKey);
 
-        await waitUntil(() => !isOpen(aFoo) && !isOpen(aBar));
-        // Each group shows the right tab: col 1 → bFoo (active stray's replacement),
-        // col 2 → outside (its non-stray visible tab, restored — NOT the newly
-        // background-opened bBar).
-        await waitUntil(() => groupActiveUri(vscode.ViewColumn.One) === bFoo);
-        await waitUntil(() => groupActiveUri(vscode.ViewColumn.Two) === outside);
-        assert.strictEqual(groupActiveUri(vscode.ViewColumn.One), bFoo, "col 1 shows bar's replacement");
-        assert.strictEqual(
-            groupActiveUri(vscode.ViewColumn.Two),
-            outside,
-            "col 2 restored to its non-stray visible tab, not the background bBar"
+        await waitUntil(() => !isOpen(aFoo) && !isOpen(aBar) && !isOpen(aBaz) && !isOpen(aQux));
+        await waitUntil(() => visibleInColumn(one) === bFoo);
+        await waitUntil(() => tabsInColumn(two).length === 3 && visibleInColumn(two) === bBaz);
+
+        // Each group keeps its ORIGINAL relative order and correct visible tab.
+        assert.deepStrictEqual(tabsInColumn(one), [bFoo], "col 1 replacement");
+        assert.deepStrictEqual(
+            tabsInColumn(two),
+            [bBar, bBaz, bQux],
+            "col 2 original order [bar, baz, qux] preserved"
         );
-        assert.ok(isOpen(bBar), "col 2's stray was remapped (bBar opened in background)");
-        // Global keyboard focus settled exactly once, on the active group (col 1).
+        assert.strictEqual(
+            visibleInColumn(two),
+            bBaz,
+            "col 2 shows its previously-visible tab's replacement (not the last-opened)"
+        );
+        // The single keyboard-focus move lands on the active group (col 1), so the
+        // final active editor is col 1's replacement — col 2's reveals used
+        // preserveFocus and never stole it.
         assert.strictEqual(
             vscode.window.activeTextEditor?.document.uri.fsPath,
             bFoo,
             "keyboard focus ended on the active group's tab"
         );
-        assert.strictEqual(
-            vscode.window.activeTextEditor?.viewColumn,
-            vscode.ViewColumn.One,
-            "focus is in column 1 (the active group), not stolen by column 2"
-        );
+        assert.strictEqual(vscode.window.activeTextEditor?.viewColumn, one, "focus is in column 1");
     });
 
     test("closes a tab whose file has no equivalent in the new worktree", async () => {
