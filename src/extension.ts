@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { getGitCommonDir, getSuperprojectPath, listWorktrees, type Worktree } from "./git";
+import { waitForClientReady, type ObservableClient } from "./lsReady";
 import { PositionCache } from "./positionCache";
 import {
     orderColumnReopens,
@@ -503,9 +504,9 @@ const LS_READY_TIMEOUT_MS = 15_000;
 // When readiness is unobservable (the language-server extension/API isn't
 // present), fall back to a fixed time gap. Measured clangd stop→start is ~5s.
 const LS_UNOBSERVABLE_GAP_MS = 6_000;
-
-/** clangd's language client can be in one of these states (vscode-languageclient). */
-const LS_STATE_RUNNING = 2; // State.Running
+// If the client is already Running when we attach, how long to wait for it to
+// leave Running before concluding the restart already completed.
+const LS_READY_GRACE_MS = 2_000;
 
 type LsReadiness = "ready" | "timeout" | "unobservable";
 
@@ -534,48 +535,29 @@ function waitForLsReady(timeoutMs: number): Promise<LsReadiness> {
 }
 
 /**
- * clangd-specific readiness probe. `extensions.getExtension(id)?.exports` exposes
- * `getApi(1) -> { languageClient }`, where languageClient is a vscode-languageclient
- * `LanguageClient` with `.state` (State.Running === 2) and `.onDidChangeState`.
- * Resolves 'ready' on Running, 'timeout' after timeoutMs, 'unobservable' if the
- * extension or API is absent.
+ * clangd-specific readiness probe: the extension/API lookup plus the
+ * 'unobservable' path; the transition-aware waiting is delegated to the pure
+ * `waitForClientReady`. `extensions.getExtension(id)?.exports` exposes
+ * `getApi(1) -> { languageClient }`, a vscode-languageclient `LanguageClient`
+ * with `.state` (State.Running === 2) and `.onDidChangeState`.
+ *
+ * Version note (vscode-clangd 0.6.0): its `clangd.restart` handler disposes the
+ * old client (fire-and-forget `stop()`) but `await`s creation of the NEW client
+ * and repoints the exported `languageClient` at it before the command resolves —
+ * so by the time we read it here the client is the fresh one, already Running,
+ * with no further transition. The stale-Running race is therefore latent for
+ * 0.6.0 (the graceMs branch resolves 'ready' for it), but live for any handler
+ * that resolves the command while the SAME client is still winding down; the
+ * transition-aware wait guards that case.
  */
 async function clangdWaitForLsReady(timeoutMs: number): Promise<LsReadiness> {
     try {
         const ext = vscode.extensions.getExtension("llvm-vs-code-extensions.vscode-clangd");
         if (!ext) {return "unobservable";}
         const exports = ext.isActive ? ext.exports : await ext.activate();
-        const client = exports?.getApi?.(1)?.languageClient as
-            | {
-                  state?: number;
-                  onDidChangeState?: (l: (e: { newState?: number }) => void) => vscode.Disposable;
-              }
-            | undefined;
+        const client = exports?.getApi?.(1)?.languageClient as ObservableClient | undefined;
         if (!client) {return "unobservable";}
-        const isRunning = (): boolean => client.state === LS_STATE_RUNNING;
-        if (isRunning()) {return "ready";}
-        return await new Promise<LsReadiness>((resolve) => {
-            let done = false;
-            let sub: vscode.Disposable | undefined;
-            const finish = (v: LsReadiness): void => {
-                if (done) {return;}
-                done = true;
-                clearTimeout(timer);
-                sub?.dispose();
-                resolve(v);
-            };
-            if (typeof client.onDidChangeState === "function") {
-                sub = client.onDidChangeState((e) => {
-                    if ((e?.newState ?? client.state) === LS_STATE_RUNNING) {finish("ready");}
-                });
-            } else {
-                const poll = setInterval(() => {
-                    if (isRunning()) {finish("ready");}
-                }, 250);
-                sub = { dispose: () => clearInterval(poll) };
-            }
-            const timer = setTimeout(() => finish("timeout"), timeoutMs);
-        });
+        return await waitForClientReady(client, { timeoutMs, graceMs: LS_READY_GRACE_MS });
     } catch (e) {
         log(`LS readiness probe failed: ${e instanceof Error ? e.message : String(e)}`);
         return "unobservable";
