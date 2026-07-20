@@ -30,3 +30,30 @@ other-worktree tab(s) and then run **clangd: Restart language server**.
 
 **How to avoid it:** don't open files from a non-active worktree directly. Switch
 to that worktree instead (the Worktrees view, or the switch command).
+
+## What a language-server restart actually fixes (measured)
+
+A headless clangd harness (`src/test/clangdScope.test.ts`) measured the restart's
+effect against a two-worktree C++ fixture and the `wt-demo` repro repo.
+
+**Restart works.** A freshly spawned clangd scoped to the active worktree
+resolves Go to Definition into *that* worktree — including cross-translation-unit
+definitions — as long as the worktree has its own compilation database
+(`compile_flags.txt`, or `.clangd` → `compile_commands.json`). The previous
+worktree's persisted `.cache/clangd` does **not** hijack it.
+
+**Without a restart**, a session that has already indexed another worktree answers
+identical-symbol (USR) queries from its warmed index, and can land in *either*
+worktree — the tie-break is order-dependent, so it can look "stuck" on the wrong
+one.
+
+**Two setups defeat the restart.** A pinned `--compile-commands-dir` argument
+survives restarts and keeps loading the old worktree's database (already flagged
+in the README). And *navigating during the restart window*: vscode-clangd's
+stop→start takes ~5 seconds, so a Go to Definition issued seconds after a switch
+may be answered by the dying or mid-start session — the wrong result reopens an
+other-worktree tab and re-contaminates the fresh session. That loop is what the
+`wt-demo` log captured.
+
+**Consequence:** the reconcile→restart coupling stays — the restart is the
+remedy, not the cost.
