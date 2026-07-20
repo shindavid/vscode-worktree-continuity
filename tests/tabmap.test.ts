@@ -8,6 +8,7 @@ import {
     planTabRemap,
     relPathUnder,
     shouldConsiderIntercept,
+    shouldRestoreSlot,
     tabPositionValue,
     targetPathFor,
     type CachedPosition,
@@ -254,6 +255,16 @@ describe("orderReopensByGroup (original order + visible metadata)", () => {
     it("omits columns that have no reopens", () => {
         const groups = orderReopensByGroup([reopen({ viewColumn: 3 })]);
         expect(groups.map((g) => g.viewColumn)).toEqual([3]);
+    });
+});
+
+describe("shouldRestoreSlot (move only newly-created tabs)", () => {
+    it("restores the slot for a genuinely new tab", () => {
+        expect(shouldRestoreSlot(false)).toBe(true);
+    });
+
+    it("does NOT move an already-open target tab (focus it in place)", () => {
+        expect(shouldRestoreSlot(true)).toBe(false);
     });
 });
 

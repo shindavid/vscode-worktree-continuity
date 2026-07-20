@@ -98,6 +98,17 @@ export function targetPathFor(oldRoot: string, newRoot: string, tabPath: string)
 }
 
 /**
+ * Whether a remap should MOVE the replacement into the stray's/active tab's slot.
+ * Only move when the replacement tab was created by this remap. If the target file
+ * was ALREADY open before the remap, navigating to it should focus that existing
+ * tab IN PLACE — moving it would displace a tab the user never asked to reorder
+ * (log7.txt: nav to an already-open file yanked it to the stray's slot).
+ */
+export function shouldRestoreSlot(targetAlreadyOpen: boolean): boolean {
+    return !targetAlreadyOpen;
+}
+
+/**
  * Convert a zero-based tab index into the 1-based `value` for
  * `workbench.action.moveActiveEditor` with `{ to: 'position', by: 'tab' }`.
  * Verified against VS Code 1.129.1: the handler computes `index = (value ?? 1) - 1`

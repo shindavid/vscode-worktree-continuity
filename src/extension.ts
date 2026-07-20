@@ -12,6 +12,7 @@ import {
     planTabRemap,
     relPathUnder,
     shouldConsiderIntercept,
+    shouldRestoreSlot,
     tabPositionValue,
     targetPathFor,
     type CachedPosition,
@@ -602,12 +603,18 @@ async function interceptSiblingOpen(doc: vscode.TextDocument): Promise<void> {
         // previously-active tab, not the clicked one. We restore the slot below.
         const strayIndex = stray.index;
 
+        // If the target file is ALREADY open, navigating to it should focus that
+        // existing tab IN PLACE — do NOT move it to the stray's slot (log7.txt).
+        const targetTab = findTextTab(vscode.Uri.file(target));
+        const restoreSlot = shouldRestoreSlot(targetTab !== null);
+
         // Re-read the LIVE editor's selection as late as possible — a go-to-def
         // target selection can land after the initial open, so latest wins.
         const liveEditor = vscode.window.visibleTextEditors.find(
             (e) => e.document.uri.toString() === uriStr
         );
-        const viewColumn = liveEditor?.viewColumn ?? stray.viewColumn;
+        // Existing target keeps its own column; a new tab opens in the stray's.
+        const viewColumn = targetTab?.viewColumn ?? liveEditor?.viewColumn ?? stray.viewColumn;
         let position: CachedPosition | undefined;
         if (liveEditor) {
             position = positionFromEditor(liveEditor);
@@ -633,21 +640,25 @@ async function interceptSiblingOpen(doc: vscode.TextDocument): Promise<void> {
         applyRemapDepth++;
         positionCache?.suspend();
         try {
-            // Show the correct editor FIRST (minimizes perceived flash), then close
-            // the stray tab.
+            // Focus the target (existing tab in place, or a new one), apply the
+            // captured nav selection, then close the stray tab.
             await openReopenAction(action, false);
             await vscode.window.tabGroups.close(stray.tab, true);
-            // Restore the clicked tab's slot: the replacement (now the active
-            // editor) landed relative to the previously-active tab, so move it to
-            // the stray's original index. After the open+close the group count is
-            // unchanged, so the recorded index is the correct target. Placement is
-            // cosmetic — never let a failure abort the remap.
-            await moveActiveEditorToIndex(strayIndex);
+            // Only restore the stray's slot for a GENUINELY NEW tab: it landed
+            // relative to the previously-active tab, so move it to the stray's
+            // index (open+close leave the count unchanged). An already-open target
+            // keeps its own position. Placement is cosmetic — never abort on error.
+            if (restoreSlot) {
+                await moveActiveEditorToIndex(strayIndex);
+            }
         } finally {
             positionCache?.resume();
             applyRemapDepth--;
         }
-        log(`Intercepted sibling open: ${p} → ${target} @${line}:${character} (slot ${strayIndex})`);
+        log(
+            `Intercepted sibling open: ${p} → ${target} @${line}:${character} ` +
+                (restoreSlot ? `(slot ${strayIndex})` : "(existing tab)")
+        );
     } catch (e) {
         log(`Intercept failed for ${p}: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -1289,6 +1300,12 @@ export async function applyTabRemap(
             }
         }
         const activeColumn = focus?.viewColumn ?? vscode.window.activeTextEditor?.viewColumn;
+        // Guard the final active-tab move: if the active replacement's tab already
+        // existed before the remap (edge: both worktrees' copies open pre-switch),
+        // moving it would displace it — only move a tab this remap created.
+        const focusRestoreSlot = focus
+            ? shouldRestoreSlot(isUriOpen(vscode.Uri.file(focus.targetPath)))
+            : false;
 
         const revealUri = async (uri: vscode.Uri, viewColumn: number): Promise<void> => {
             if (!isUriOpen(uri)) {return;}
@@ -1346,14 +1363,17 @@ export async function applyTabRemap(
         }
 
         // (5) Settle keyboard focus exactly once on the active replacement, then
-        // move it back to the active tab's original index (undo step (1)).
+        // move it back to the active tab's original index (undo step (1)) — but
+        // only if this remap created it; a pre-existing tab keeps its place.
         if (focus) {
             await openReopenAction(focus, false);
-            // moveActiveEditor acts on the active editor; showTextDocument's
-            // active-editor update can lag the await, so confirm the replacement
-            // is active before moving (else the move is a silent no-op).
-            await waitForActiveUri(vscode.Uri.file(focus.targetPath), 500);
-            await moveActiveEditorToIndex(focus.tabIndex);
+            if (focusRestoreSlot) {
+                // moveActiveEditor acts on the active editor; showTextDocument's
+                // active-editor update can lag the await, so confirm the replacement
+                // is active before moving (else the move is a silent no-op).
+                await waitForActiveUri(vscode.Uri.file(focus.targetPath), 500);
+                await moveActiveEditorToIndex(focus.tabIndex);
+            }
         } else if (activeColumn !== undefined && activeGroup && activeGroup.ordered.length > 0) {
             // Active tab wasn't a stray: restore focus to it.
             const uri = groupVisible.get(activeColumn);

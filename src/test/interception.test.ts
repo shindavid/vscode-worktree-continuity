@@ -257,4 +257,42 @@ suite("sibling-open interception (integration)", () => {
             "the replacement takes focus (interception opens with focus)"
         );
     });
+
+    // Regression (log7.txt): when interception's target is ALREADY open, focus
+    // that existing tab IN PLACE — do not move it to the stray's slot.
+    test("focuses an already-open target in place (no move, no new tab)", async () => {
+        const col = vscode.ViewColumn.One;
+        const featH = path.join(fx.featureRoot, "src", "greeting.h"); // target, ALREADY open @0
+        const featTs = path.join(fx.featureRoot, "a.ts"); // active-wt tab @1 (active)
+        const mainH = path.join(fx.mainRoot, "src", "greeting.h"); // sibling stray of featH
+
+        // feature/greeting.h at index 0; feature/a.ts active at index 1.
+        await vscode.window.showTextDocument(vscode.Uri.file(featH), { viewColumn: col, preview: false });
+        await vscode.window.showTextDocument(vscode.Uri.file(featTs), { viewColumn: col, preview: false });
+        await waitUntil(() => isOpen(featH) && isOpen(featTs));
+        await waitUntil(() => vscode.window.activeTextEditor?.document.uri.fsPath === featTs);
+        assert.deepStrictEqual(tabsInColumn(col), [featH, featTs], "fixture: target at index 0");
+
+        // Navigate into the sibling stray (resolves into the wrong worktree).
+        const strayDoc = await vscode.workspace.openTextDocument(vscode.Uri.file(mainH));
+        await vscode.window.showTextDocument(strayDoc, { viewColumn: col, preview: false });
+        await waitUntil(() => isOpen(mainH));
+
+        await __test.interceptSiblingOpen(strayDoc);
+
+        await waitUntil(() => !isOpen(mainH), 6000);
+        // The pre-existing target stayed at index 0 (NOT yanked to the stray's
+        // slot), no duplicate tab was created, and it is focused.
+        assert.deepStrictEqual(
+            tabsInColumn(col),
+            [featH, featTs],
+            "existing target stayed at index 0; stray closed; no new tab"
+        );
+        assert.strictEqual(tabsInColumn(col)[0], featH, "feature/greeting.h still at index 0");
+        assert.strictEqual(
+            vscode.window.activeTextEditor?.document.uri.fsPath,
+            featH,
+            "the already-open target is focused in place"
+        );
+    });
 });
