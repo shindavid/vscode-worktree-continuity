@@ -645,7 +645,7 @@ function recordEditorTopLine(editor: vscode.TextEditor): void {
 // ---------------------------------------------------------------------------
 
 function tabKey(viewColumn: number, fsPath: string): string {
-    return `${viewColumn} ${fsPath}`;
+    return `${viewColumn}\0${fsPath}`;
 }
 
 /**
@@ -1254,4 +1254,36 @@ async function openTerminalInWorktreeCommand(): Promise<void> {
     terminal.show();
     log(`Opened terminal in ${picked.worktree.path}`);
 }
+
+// ---------------------------------------------------------------------------
+// Test-only surface. NOT part of the extension's public API — used by the
+// integration harness (src/test) to drive the reactive logic deterministically
+// without a live language server or GUI gestures.
+// ---------------------------------------------------------------------------
+export const __test = {
+    reconcileOpenTabs,
+    restartLanguageServers,
+    scheduleLanguageServerRestart,
+    siblingWorktreeTabs,
+    deriveActiveWorktree,
+    getActiveWorktree(): string | null {
+        return activeWorktreePath;
+    },
+    setActiveWorktree(p: string | null): void {
+        activeWorktreePath = p;
+        worktreeView?.setActive(p);
+    },
+    async loadReposFrom(cwd: string): Promise<RepoSnapshot[]> {
+        const snap = await getRepoSnapshot(cwd);
+        lastKnownRepos = snap ? [snap] : [];
+        return lastKnownRepos;
+    },
+    resetLsRestartState(): void {
+        if (lsRestartTimer) {
+            clearTimeout(lsRestartTimer);
+            lsRestartTimer = undefined;
+        }
+        lastLsRestartAt = 0;
+    },
+};
 
