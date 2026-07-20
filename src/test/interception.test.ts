@@ -35,6 +35,16 @@ function findTab(fsPath: string): vscode.Tab | undefined {
     return undefined;
 }
 
+/** fsPaths of the text tabs in a view column, left-to-right. */
+function tabsInColumn(col: vscode.ViewColumn): string[] {
+    const g = vscode.window.tabGroups.all.find((gr) => gr.viewColumn === col);
+    return (g?.tabs ?? [])
+        .filter((t): t is vscode.Tab & { input: vscode.TabInputText } =>
+            t.input instanceof vscode.TabInputText
+        )
+        .map((t) => t.input.uri.fsPath);
+}
+
 suite("sibling-open interception (integration)", () => {
     let fx: WorktreeFixture;
 
@@ -203,5 +213,48 @@ suite("sibling-open interception (integration)", () => {
         await __test.interceptSiblingOpen(doc);
         await waitUntil(() => isOpen(featCpp) && !isOpen(mainCpp), 6000);
         assert.strictEqual(isOpen(mainCpp), false, "intercepted once startup grace completes");
+    });
+
+    // Regression: clicking a parked stray fires didOpen while the tab is still
+    // loading (before it's active), so the replacement must be moved back to the
+    // clicked tab's slot instead of landing at the front of the group.
+    test("remaps a parked (non-active) stray back into its original tab slot", async () => {
+        const col = vscode.ViewColumn.One;
+        const featH = path.join(fx.featureRoot, "src", "greeting.h"); // A: active-wt, index 0
+        const mainCpp = path.join(fx.mainRoot, "src", "greeting.cpp"); // stray, index 1
+        const featCpp = path.join(fx.featureRoot, "src", "greeting.cpp"); // its replacement
+        const featTs = path.join(fx.featureRoot, "a.ts"); // C: active-wt, index 2
+
+        // Open A, stray, C in order so the stray is at index 1.
+        await vscode.window.showTextDocument(vscode.Uri.file(featH), { viewColumn: col, preview: false });
+        const strayDoc = await vscode.workspace.openTextDocument(vscode.Uri.file(mainCpp));
+        await vscode.window.showTextDocument(strayDoc, { viewColumn: col, preview: false });
+        await vscode.window.showTextDocument(vscode.Uri.file(featTs), { viewColumn: col, preview: false });
+        await waitUntil(() => isOpen(featH) && isOpen(mainCpp) && isOpen(featTs));
+
+        // Focus A so the stray is NOT the active tab (the didOpen-before-active case).
+        await vscode.window.showTextDocument(vscode.Uri.file(featH), { viewColumn: col, preview: false });
+        await waitUntil(() => vscode.window.activeTextEditor?.document.uri.fsPath === featH);
+        assert.deepStrictEqual(
+            tabsInColumn(col),
+            [featH, mainCpp, featTs],
+            "fixture: stray sits at index 1"
+        );
+
+        await __test.interceptSiblingOpen(strayDoc);
+
+        await waitUntil(() => isOpen(featCpp) && !isOpen(mainCpp), 6000);
+        await waitUntil(() => tabsInColumn(col)[1] === featCpp);
+        assert.deepStrictEqual(
+            tabsInColumn(col),
+            [featH, featCpp, featTs],
+            "replacement landed at the stray's slot (index 1), tab order preserved"
+        );
+        assert.strictEqual(isOpen(mainCpp), false, "the stray tab was closed");
+        assert.strictEqual(
+            vscode.window.activeTextEditor?.document.uri.fsPath,
+            featCpp,
+            "the replacement takes focus (interception opens with focus)"
+        );
     });
 });

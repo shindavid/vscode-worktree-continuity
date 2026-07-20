@@ -97,6 +97,17 @@ export function targetPathFor(oldRoot: string, newRoot: string, tabPath: string)
     return path.join(newRoot, rel);
 }
 
+/**
+ * Convert a zero-based tab index into the 1-based `value` for
+ * `workbench.action.moveActiveEditor` with `{ to: 'position', by: 'tab' }`.
+ * Verified against VS Code 1.129.1: the handler computes `index = (value ?? 1) - 1`
+ * and clamps into range, so `value = index + 1` lands the active editor at that
+ * index. Guards against a negative index (defaults to the first slot).
+ */
+export function tabPositionValue(index: number): number {
+    return Math.max(1, index + 1);
+}
+
 export interface InterceptGate {
     /** Feature toggle (off in suites that need strays to persist). */
     enabled: boolean;

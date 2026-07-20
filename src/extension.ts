@@ -12,6 +12,7 @@ import {
     planTabRemap,
     relPathUnder,
     shouldConsiderIntercept,
+    tabPositionValue,
     targetPathFor,
     type CachedPosition,
     type ReopenAction,
@@ -418,14 +419,17 @@ async function reconcileOpenTabs(repos: RepoSnapshot[]): Promise<number> {
     return remapped;
 }
 
-/** The open text tab (and its column) for a uri, if any. */
-function findTextTab(uri: vscode.Uri): { tab: vscode.Tab; viewColumn: number } | null {
+/** The open text tab (its column and zero-based index in the group) for a uri. */
+function findTextTab(
+    uri: vscode.Uri
+): { tab: vscode.Tab; viewColumn: number; index: number } | null {
     const uriStr = uri.toString();
     for (const group of vscode.window.tabGroups.all) {
-        for (const t of group.tabs) {
-            if (t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr) {
-                return { tab: t, viewColumn: group.viewColumn };
-            }
+        const index = group.tabs.findIndex(
+            (t) => t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr
+        );
+        if (index !== -1) {
+            return { tab: group.tabs[index], viewColumn: group.viewColumn, index };
         }
     }
     return null;
@@ -477,6 +481,23 @@ function waitForVisibleEditor(
         }, 25);
         const timer = setTimeout(() => finish(find()), timeoutMs);
     });
+}
+
+/**
+ * Move the active editor to a zero-based tab index within its group. Best-effort:
+ * if the command's arg schema drifts in a future VS Code, log and leave the tab
+ * where it is rather than throwing — placement is cosmetic, the remap must finish.
+ */
+async function moveActiveEditorToIndex(index: number): Promise<void> {
+    try {
+        await vscode.commands.executeCommand("workbench.action.moveActiveEditor", {
+            to: "position",
+            by: "tab",
+            value: tabPositionValue(index),
+        });
+    } catch (e) {
+        log(`Intercept: moveActiveEditor failed, leaving replacement misplaced: ${e instanceof Error ? e.message : String(e)}`);
+    }
 }
 
 function positionFromEditor(editor: vscode.TextEditor): CachedPosition {
@@ -547,6 +568,11 @@ async function interceptSiblingOpen(doc: vscode.TextDocument): Promise<void> {
         }
         const stray = findTextTab(doc.uri);
         if (!stray) {return;} // no tab to remap (never painted, or already gone)
+        // Record the stray's slot BEFORE any open/close. didOpen fires while the
+        // clicked tab is still LOADING — before it becomes the group's active tab —
+        // so showTextDocument would place the replacement relative to the
+        // previously-active tab, not the clicked one. We restore the slot below.
+        const strayIndex = stray.index;
 
         // Re-read the LIVE editor's selection as late as possible — a go-to-def
         // target selection can land after the initial open, so latest wins.
@@ -583,11 +609,17 @@ async function interceptSiblingOpen(doc: vscode.TextDocument): Promise<void> {
             // the stray tab.
             await openReopenAction(action, false);
             await vscode.window.tabGroups.close(stray.tab, true);
+            // Restore the clicked tab's slot: the replacement (now the active
+            // editor) landed relative to the previously-active tab, so move it to
+            // the stray's original index. After the open+close the group count is
+            // unchanged, so the recorded index is the correct target. Placement is
+            // cosmetic — never let a failure abort the remap.
+            await moveActiveEditorToIndex(strayIndex);
         } finally {
             positionCache?.resume();
             applyRemapDepth--;
         }
-        log(`Intercepted sibling open: ${p} → ${target} @${line}:${character}`);
+        log(`Intercepted sibling open: ${p} → ${target} @${line}:${character} (slot ${strayIndex})`);
     } catch (e) {
         log(`Intercept failed for ${p}: ${e instanceof Error ? e.message : String(e)}`);
     } finally {

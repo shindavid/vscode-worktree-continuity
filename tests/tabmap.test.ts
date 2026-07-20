@@ -8,6 +8,7 @@ import {
     planTabRemap,
     relPathUnder,
     shouldConsiderIntercept,
+    tabPositionValue,
     targetPathFor,
     type CachedPosition,
     type InterceptGate,
@@ -251,6 +252,19 @@ describe("orderReopensByGroup (per-group visible-last ordering)", () => {
     it("omits columns that have no reopens", () => {
         const groups = orderReopensByGroup([reopen({ viewColumn: 3 })]);
         expect(groups.map((g) => g.viewColumn)).toEqual([3]);
+    });
+});
+
+describe("tabPositionValue (moveActiveEditor position arg)", () => {
+    it("converts a zero-based index to the 1-based position value", () => {
+        expect(tabPositionValue(0)).toBe(1);
+        expect(tabPositionValue(1)).toBe(2);
+        expect(tabPositionValue(5)).toBe(6);
+    });
+
+    it("guards against a negative index (defaults to the first slot)", () => {
+        expect(tabPositionValue(-1)).toBe(1);
+        expect(tabPositionValue(-10)).toBe(1);
     });
 });
 
