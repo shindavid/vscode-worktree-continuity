@@ -30,6 +30,7 @@
     "SCM Providers"
   ],
   "activationEvents": [
+    "workspaceContains:.git",
     "onStartupFinished"
   ],
   "main": "./dist/extension.js",

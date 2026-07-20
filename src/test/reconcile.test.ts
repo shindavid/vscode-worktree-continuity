@@ -105,6 +105,27 @@ suite("reconcile + language-server restart (integration)", () => {
         );
     });
 
+    test("snapshot-primed reconcile converges: a second pass over fresh discovery remaps 0", async () => {
+        const mainCpp = path.join(fx.mainRoot, "src", "greeting.cpp");
+        const featCpp = path.join(fx.featureRoot, "src", "greeting.cpp");
+        await vscode.window.showTextDocument(vscode.Uri.file(mainCpp), { preview: false });
+        await waitUntil(() => isOpen(mainCpp));
+
+        // Pass 1: driven from the persisted snapshot (loadReposFrom stands in for
+        // the primed snapshot — no discovery on the critical path).
+        const snapshot = await __test.loadReposFrom(fx.featureRoot);
+        const n1 = await __test.reconcileOpenTabs(snapshot);
+        assert.strictEqual(n1, 1, "snapshot pass remaps the one stray");
+        await waitUntil(() => !isOpen(mainCpp) && isOpen(featCpp));
+
+        // Pass 2: authoritative discovery re-drives reconcile — must find 0 strays
+        // (idempotent convergence), so no double-remap / churn.
+        const fresh = await __test.loadReposFrom(fx.featureRoot);
+        const n2 = await __test.reconcileOpenTabs(fresh);
+        assert.strictEqual(n2, 0, "discovery pass finds nothing left to remap");
+        assert.strictEqual(__test.siblingWorktreeTabs().length, 0, "no sibling tabs remain");
+    });
+
     test("restartLanguageServers runs each configured, registered command once", async () => {
         await __test.restartLanguageServers();
         assert.strictEqual(lsRestartCount, 1, "the fake LS restart command ran exactly once");

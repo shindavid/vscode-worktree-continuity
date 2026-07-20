@@ -20,6 +20,7 @@ import {
 import {
     repoDisplayName,
     shouldDescendInto,
+    siblingWorktreeRoots,
     worktreeLabel,
     type RepoSnapshot,
 } from "./worktrees";
@@ -47,6 +48,19 @@ let watchedCommonDirs = "";
 let watcherRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 
 const PRIMED_REPOS_KEY = "worktree-continuity.lastRepos.v1";
+// Persisted per-window so the next session can drive the first reconcile without
+// waiting for git discovery. Worktree map: globalState (shared, keyed by repo
+// common dir). Active worktree: workspaceState (this window's).
+const ACTIVE_WORKTREE_KEY = "worktree-continuity.activeWorktree.v1";
+
+function persistActiveWorktree(): void {
+    if (!extensionContext) {return;}
+    void extensionContext.workspaceState.update(ACTIVE_WORKTREE_KEY, activeWorktreePath ?? undefined);
+}
+
+function loadPersistedActiveWorktree(context: vscode.ExtensionContext): string | null {
+    return context.workspaceState.get<string>(ACTIVE_WORKTREE_KEY) ?? null;
+}
 
 /**
  * Watch each repo's `<git-common-dir>/worktrees/` directory so the view updates
@@ -114,6 +128,7 @@ function refreshActiveFromFolders(): void {
     activeWorktreePath = deriveActiveWorktree();
     log(`Active worktree = ${activeWorktreePath ?? "<none>"}`);
     worktreeView?.setActive(activeWorktreePath);
+    persistActiveWorktree();
     void updateWindowTitle();
 }
 
@@ -328,17 +343,15 @@ async function reconcileOpenTabs(repos: RepoSnapshot[]): Promise<number> {
     if (!carryTabs || !activeWorktreePath) {return 0;}
     const active = activeWorktreePath;
 
-    const repo = repos.find((r) => r.worktrees.some((w) => !w.bare && samePath(w.path, active)));
-    if (!repo) {return 0;}
-    const siblings = repo.worktrees
-        .filter((w) => !w.bare && !samePath(w.path, active))
-        .map((w) => w.path);
+    const found = siblingWorktreeRoots(repos, active, samePath);
+    if (!found) {return 0;}
+    const { commonDir, siblings } = found;
 
     let remapped = 0;
     for (const sibling of siblings) {
         try {
             const { plan, tabByKey } = await buildTabRemapPlan(sibling, active, (rel) =>
-                positionCache?.get(repo.commonDir, rel)
+                positionCache?.get(commonDir, rel)
             );
             if (plan.reopen.length === 0) {continue;}
             // Only remap tabs that have an equivalent; leave orphan tabs open.
@@ -800,8 +813,10 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Register the tree view first, primed from persisted state, so it renders
     // instantly (no async discovery on the render path).
-    activeWorktreePath = deriveActiveWorktree();
-    worktreeView = new WorktreeViewProvider(loadPrimedRepos(context), activeWorktreePath);
+    activeWorktreePath = deriveActiveWorktree() ?? loadPersistedActiveWorktree(context);
+    const primedRepos = loadPrimedRepos(context);
+    if (primedRepos.length > 0) {lastKnownRepos = primedRepos;}
+    worktreeView = new WorktreeViewProvider(primedRepos, activeWorktreePath);
     context.subscriptions.push(
         vscode.window.registerTreeDataProvider(WORKTREE_VIEW_ID, worktreeView),
         vscode.window.registerFileDecorationProvider(new CurrentWorktreeDecorationProvider())
@@ -893,29 +908,53 @@ export function activate(context: vscode.ExtensionContext) {
     const graceTimer = setTimeout(markStartupReconcileDone, STARTUP_GRACE_MS);
     context.subscriptions.push({ dispose: () => clearTimeout(graceTimer) });
 
-    setTimeout(async () => {
-        try {
-            // Establish the anchor layout now (folding its one-time restart into
-            // the initial load) so the first switch is instant. If it fires, a
-            // restart is imminent — the reactivated host will run the rest.
-            if (await ensureAnchoredLayout()) {return;}
-            const repos = await getRepos();
-            worktreeView?.refresh();
-            const remapped = await reconcileOpenTabs(repos);
-            // If we had to close stray sibling-worktree tabs, re-scope the language
-            // server(s): clangd may have already loaded the other worktree's
-            // project from those tabs, and a restart now (with them gone) drops it.
-            if (remapped > 0) {
+    // Start the open-time reconcile IMMEDIATELY — no defer. onStartupFinished
+    // already fires late (after the window paints with restored stale tabs), so
+    // every extra millisecond is a visible rearrangement on a settled window.
+    void runStartupReconcile(primedRepos);
+}
+
+/**
+ * Open-time reconcile, run as early as possible. Two passes:
+ *   1. From the persisted worktree snapshot (no git discovery), so stray
+ *      session-restored tabs are remapped before discovery latency elapses.
+ *   2. From authoritative git discovery, which re-drives reconcile (idempotent —
+ *      normally 0 strays), refreshes the view, and persists a fresh snapshot.
+ * Reconcile is idempotent, so a stale snapshot converges once discovery corrects
+ * it. Interception stays off (startup grace) until this completes, so restored
+ * tabs get one batched reconcile instead of N racing per-tab intercepts.
+ */
+async function runStartupReconcile(primed: RepoSnapshot[]): Promise<void> {
+    try {
+        // Establish the anchor layout if a single worktree was opened directly.
+        // That triggers a one-time host restart; the reactivated host runs this
+        // again with the [anchor, worktree] layout.
+        if (await ensureAnchoredLayout()) {return;}
+
+        // Pass 1 — snapshot-primed, no discovery on the critical path.
+        if (primed.length > 0) {
+            const n = await reconcileOpenTabs(primed);
+            if (n > 0) {
+                log(`Startup reconcile (snapshot): remapped ${n} tab(s)`);
                 scheduleLanguageServerRestart();
             }
-            await updateWindowTitle();
-        } catch (e) {
-            log(`Pre-warm failed: ${e instanceof Error ? e.message : String(e)}`);
-        } finally {
-            // Initial reconcile has run once — per-tab interception may now engage.
-            markStartupReconcileDone();
         }
-    }, 100);
+
+        // Pass 2 — authoritative discovery re-drives the reconcile.
+        const repos = await getRepos();
+        worktreeView?.refresh();
+        const n2 = await reconcileOpenTabs(repos);
+        if (n2 > 0) {
+            log(`Startup reconcile (discovery): remapped ${n2} more tab(s)`);
+            scheduleLanguageServerRestart();
+        }
+        await updateWindowTitle();
+    } catch (e) {
+        log(`Startup reconcile failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+        // Initial reconcile has run once — per-tab interception may now engage.
+        markStartupReconcileDone();
+    }
 }
 
 export function deactivate() {
@@ -1090,16 +1129,20 @@ async function openReopenAction(action: ReopenAction, preserveFocus: boolean): P
 }
 
 /**
- * Apply a remap plan. Batched choreography (kills the open-time tab flicker):
- *   (a) note which stray was the globally-active tab;
- *   (b) open ALL replacement editors first, in the background (preserveFocus), in
- *       (column, tabIndex) order, applying each saved selection/scroll;
- *   (c) close ALL strays (reopened + no-target) in a single batch;
- *   (d) exactly one focus move — to the replacement of the previously-active
- *       stray, or none if the active tab wasn't a remapped stray.
+ * Apply a remap plan. Stable-strip choreography — the tab strip peaks at N+1
+ * (not 2N) and the focused editor's visible content never changes:
+ *   (1) if the globally-active tab is a remapped stray, open ITS replacement
+ *       first WITH focus (identical content + restored position → perceived no-op
+ *       in the editor area, and focus is settled before any close);
+ *   (2) batch-close ALL strays (reopened + no-target, minus dirty-skips) in one
+ *       tabGroups.close call;
+ *   (3) open the remaining replacements in the background (preserveFocus), in
+ *       (column, tabIndex) order.
+ * If the active tab isn't a stray, step (1) is skipped and focus never moves —
+ * the remaining replacements just open in the background batch.
  * Remap semantics (dirty-skip, closeMissing, relative order, restored position)
- * are unchanged; only the sequencing differs. The whole sequence stays inside the
- * applyRemapDepth window so every open/close reads as self/remap, not external.
+ * are unchanged. The whole sequence stays inside the applyRemapDepth window so
+ * every open/close reads as self/remap, not external.
  */
 export async function applyTabRemap(
     plan: TabRemapPlan,
@@ -1109,19 +1152,18 @@ export async function applyTabRemap(
     applyRemapDepth++;
     cache?.suspend();
     try {
-        // (a) The one replacement that should end up focused (equivalent of the
-        // previously globally-active stray), or undefined to leave focus be.
+        // (1) The replacement of the previously globally-active stray, if any.
         const focus = focusTarget(plan);
-
-        // (b) Open every replacement in the background BEFORE closing anything, so
-        // the active editor never hops across intermediate tabs. revealRange still
-        // restores scroll on a non-focused editor.
-        for (const a of orderReopens(plan.reopen)) {
-            await openReopenAction(a, true);
+        // Remember the pre-remap active editor so, if the active tab was NOT a
+        // remapped stray, we can restore focus to it (a background open of a
+        // replacement still becomes the active editor, so we must put it back).
+        const preActiveUri = vscode.window.activeTextEditor?.document.uri;
+        if (focus) {
+            await openReopenAction(focus, false);
         }
 
-        // (c) Close all strays we reopened plus the no-target ones, in a single
-        // batch. Dirty tabs (plan.skipDirty) are deliberately left open.
+        // (2) Close all strays (reopened + no-target) in one batch. Dirty tabs
+        // (plan.skipDirty) are deliberately left open.
         const toClose: vscode.Tab[] = [];
         for (const a of [...plan.reopen, ...plan.closeMissing]) {
             const t = tabByKey.get(tabKey(a.viewColumn, a.sourcePath));
@@ -1131,14 +1173,46 @@ export async function applyTabRemap(
             await vscode.window.tabGroups.close(toClose, true);
         }
 
-        // (d) Exactly one focus move.
+        // (3) Open the remaining replacements in the background, ordered by
+        // (column, tabIndex). revealRange still restores scroll on a non-focused
+        // editor. `focus` (if any) is already open, so skip it.
+        const rest = focus ? plan.reopen.filter((a) => a !== focus) : plan.reopen;
+        for (const a of orderReopens(rest)) {
+            await openReopenAction(a, true);
+        }
+
+        // (4) Settle focus deterministically. Background opens above change the
+        // active editor, so re-assert it exactly once: to the active stray's
+        // replacement, or — if the active tab wasn't a stray — back to it.
         if (focus) {
             await openReopenAction(focus, false);
+        } else if (rest.length > 0 && preActiveUri && isUriOpen(preActiveUri)) {
+            try {
+                await vscode.window.showTextDocument(preActiveUri, {
+                    preserveFocus: false,
+                    preview: false,
+                });
+            } catch {
+                // best-effort focus restore
+            }
         }
     } finally {
         cache?.resume();
         applyRemapDepth--;
     }
+}
+
+/** Whether a uri currently has an open text tab. */
+function isUriOpen(uri: vscode.Uri): boolean {
+    const s = uri.toString();
+    for (const group of vscode.window.tabGroups.all) {
+        for (const t of group.tabs) {
+            if (t.input instanceof vscode.TabInputText && t.input.uri.toString() === s) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 function summarizeDropped(plan: TabRemapPlan): string | null {
@@ -1351,6 +1425,7 @@ async function performSwitch(repo: RepoSnapshot, worktree: Worktree): Promise<vo
         // From this point, sibling/active classification is correct again.
         activeWorktreePath = newRoot;
         worktreeView?.setActive(newRoot);
+        persistActiveWorktree();
         await positionCache?.flush();
 
         const label = worktreeLabel(worktree);

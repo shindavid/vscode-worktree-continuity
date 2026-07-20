@@ -158,6 +158,36 @@ suite("tab carry (integration)", () => {
         assert.strictEqual(isOpen(aBaz), false, "stray baz.ts closed");
     });
 
+    test("when the active tab is not a stray, focus never moves during the remap", async () => {
+        const aFoo = path.join(aRoot, "src", "foo.ts");
+        // A file outside both worktrees: it is NOT part of the remap plan, so it
+        // must remain the active editor throughout.
+        const outside = path.join(dir, "outside.ts");
+        fs.writeFileSync(outside, FILE_BODY);
+
+        await vscode.window.showTextDocument(vscode.Uri.file(aFoo), { preview: false });
+        await vscode.window.showTextDocument(vscode.Uri.file(outside), { preview: false });
+        await waitUntil(() => isOpen(aFoo) && isOpen(outside));
+        await waitUntil(() => vscode.window.activeTextEditor?.document.uri.fsPath === outside);
+
+        const { plan, tabByKey } = await buildTabRemapPlan(aRoot, bRoot, () => undefined);
+        // Sanity: no reopen is globally-focused (the active tab wasn't a stray).
+        assert.strictEqual(
+            plan.reopen.some((r) => r.focusGlobally),
+            false,
+            "no reopen is flagged focusGlobally"
+        );
+
+        await applyTabRemap(plan, tabByKey);
+
+        await waitUntil(() => !isOpen(aFoo)); // stray remapped away
+        assert.strictEqual(
+            vscode.window.activeTextEditor?.document.uri.fsPath,
+            outside,
+            "focus never moved: the non-stray active tab stayed active"
+        );
+    });
+
     test("closes a tab whose file has no equivalent in the new worktree", async () => {
         const aOnly = path.join(aRoot, "src", "only-in-a.ts");
         await vscode.window.showTextDocument(vscode.Uri.file(aOnly), { preview: false });

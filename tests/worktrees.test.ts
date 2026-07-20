@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { Worktree } from "../src/git";
-import { repoDisplayName, shouldDescendInto, worktreeLabel } from "../src/worktrees";
+import {
+    repoDisplayName,
+    shouldDescendInto,
+    siblingWorktreeRoots,
+    worktreeLabel,
+    type RepoSnapshot,
+} from "../src/worktrees";
 
 const wt = (overrides: Partial<Worktree>): Worktree => ({
     path: "/repo/main",
@@ -59,5 +65,45 @@ describe("shouldDescendInto", () => {
     it("descends into ordinary directories", () => {
         expect(shouldDescendInto("src")).toBe(true);
         expect(shouldDescendInto("packages")).toBe(true);
+    });
+});
+
+describe("siblingWorktreeRoots", () => {
+    const repo = (worktrees: Worktree[]): RepoSnapshot => ({
+        commonDir: "/repo/main/.git",
+        name: "repo",
+        worktrees,
+    });
+    const repos: RepoSnapshot[] = [
+        repo([
+            wt({ path: "/repo/main", branch: "main" }),
+            wt({ path: "/repo/feature", branch: "feature" }),
+            wt({ path: "/repo/hotfix", branch: "hotfix" }),
+            wt({ path: "/repo/.bare", bare: true }),
+        ]),
+    ];
+
+    it("returns the non-bare siblings of the active worktree", () => {
+        const res = siblingWorktreeRoots(repos, "/repo/feature");
+        expect(res).toEqual({
+            commonDir: "/repo/main/.git",
+            siblings: ["/repo/main", "/repo/hotfix"],
+        });
+    });
+
+    it("excludes the active worktree and any bare entry", () => {
+        const res = siblingWorktreeRoots(repos, "/repo/main");
+        expect(res?.siblings).toEqual(["/repo/feature", "/repo/hotfix"]);
+    });
+
+    it("returns null when no repo owns the active worktree", () => {
+        expect(siblingWorktreeRoots(repos, "/elsewhere/wt")).toBeNull();
+    });
+
+    it("honors an injected same-root comparator (trailing slash)", () => {
+        const sameRoot = (a: string, b: string): boolean =>
+            a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+        const res = siblingWorktreeRoots(repos, "/repo/feature/", sameRoot);
+        expect(res?.siblings).toEqual(["/repo/main", "/repo/hotfix"]);
     });
 });
