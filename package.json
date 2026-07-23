@@ -2,9 +2,10 @@
   "name": "vscode-worktree-continuity",
   "displayName": "Worktree Continuity",
   "description": "Switch between git worktrees in a single VS Code window without reloading, carrying your open editor tabs (with cursor/scroll position) over to the equivalent files in the target worktree. Designed for use with Claude Code.",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "publisher": "shindavid",
   "license": "MIT",
+  "icon": "images/icon.png",
   "homepage": "https://github.com/shindavid/vscode-worktree-continuity#readme",
   "repository": {
     "type": "git",
