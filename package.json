@@ -143,6 +143,16 @@
             "typescript.restartTsServer"
           ],
           "markdownDescription": "Command IDs to run (debounced) to re-scope language servers to the active worktree after a switch or after reconciling stray tabs. Many language servers keep the previous worktree's index across a folder swap, so without this, Go to Definition can resolve a shared symbol (e.g. a function declared in a header) to the wrong worktree's copy.\n\nThe default covers common servers (clangd, Pylance, gopls, rust-analyzer, tsserver); **commands that aren't registered are skipped**, so only your installed servers are actually restarted. Add your own language server's restart command here if it isn't listed. Set to `[]` to disable. There is no VS Code API to enumerate language servers, so this list is necessarily curated."
+        },
+        "worktree-continuity.languageServerReadinessExtensions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {
+            "clangd.restart": "llvm-vs-code-extensions.vscode-clangd"
+          },
+          "markdownDescription": "Map of `restart command` → `extension id`. After running a restart command (from `#worktree-continuity.languageServerRestartCommands#`), the extension watches the named extension's exported language client to know when the server is Running again — so a rapid sequence of switches can fire an immediate coalesced follow-up restart instead of waiting a fixed ~6s gap.\n\nThe client is read from the extension's `exports` via `getApi(1).languageClient`, `languageClient`, or `client` (in that order). Commands **without** an entry here, extensions whose client can't be found, and entries for extensions that **aren't installed** simply fall back to the fixed time gap — nothing breaks.\n\n*clangd note:* vscode-clangd 0.6.0's `clangd.restart` handler awaits the new client's creation and repoints the exported `languageClient` before the command resolves, so the readiness observation sees the fresh client; the probe is transition-aware to handle other servers/versions that resolve their restart while the old client is still winding down."
         }
       }
     }

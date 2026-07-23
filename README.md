@@ -108,6 +108,15 @@ working directory, which doesn't track the active worktree.
   commands that are actually registered run, so add your server's restart command
   if it isn't listed, or set `[]` to disable. (There's no VS Code API to
   enumerate language servers, so this list is curated.)
+- `worktree-continuity.languageServerReadinessExtensions` — map of `restart
+  command` → `extension id`. After running a restart command, the extension
+  watches the named extension's exported language client (read from `exports`
+  via `getApi(1).languageClient`, `languageClient`, or `client`) to know when the
+  server is Running again, so a burst of switches can fire an immediate coalesced
+  follow-up restart instead of waiting a fixed ~6s gap. Default maps
+  `clangd.restart` → `llvm-vs-code-extensions.vscode-clangd`. Commands without an
+  entry, extensions that aren't installed, and clients that can't be found all
+  fall back to the fixed gap — nothing breaks.
 - `workbench.colorCustomizations` → `worktreeContinuity.currentWorktreeForeground`
   overrides the green used for the current worktree.
 

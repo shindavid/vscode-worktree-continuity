@@ -218,4 +218,33 @@ suite("reconcile + language-server restart (integration)", () => {
             __test.resetLsRestartState();
         }
     });
+
+    test("config-driven readiness: empty map (and absent extensions) → 'unobservable'", async () => {
+        const cfg = vscode.workspace.getConfiguration();
+        const key = "worktree-continuity.languageServerReadinessExtensions";
+        const original = cfg.get<Record<string, string>>(key);
+        try {
+            // Empty map: nothing to observe regardless of which commands ran → the
+            // fixed time-gap fallback path ('unobservable').
+            await cfg.update(key, {}, vscode.ConfigurationTarget.Global);
+            const r1 = await __test.probeLsReadinessViaConfig([LS_CMD], 1000);
+            assert.strictEqual(r1, "unobservable", "empty map yields unobservable");
+
+            // A mapping for a command that ran but whose extension isn't installed
+            // is ignored → still unobservable.
+            await cfg.update(
+                key,
+                { [LS_CMD]: "nonexistent.extension.id" },
+                vscode.ConfigurationTarget.Global
+            );
+            const r2 = await __test.probeLsReadinessViaConfig([LS_CMD], 1000);
+            assert.strictEqual(r2, "unobservable", "absent extension is ignored");
+
+            // A mapping whose command did NOT run this cycle is skipped → unobservable.
+            const r3 = await __test.probeLsReadinessViaConfig([], 1000);
+            assert.strictEqual(r3, "unobservable", "command that didn't run is skipped");
+        } finally {
+            await cfg.update(key, original, vscode.ConfigurationTarget.Global);
+        }
+    });
 });

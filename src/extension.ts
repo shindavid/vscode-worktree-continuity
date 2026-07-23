@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { getGitCommonDir, getSuperprojectPath, listWorktrees, type Worktree } from "./git";
-import { waitForClientReady, type ObservableClient } from "./lsReady";
+import { extractLanguageClient, waitForClientReady } from "./lsReady";
 import { PositionCache } from "./positionCache";
 import {
     focusTarget,
@@ -718,47 +718,62 @@ let lsRestartPending = false;
 let lsRestartGen = 0;
 let lsUnobservableTimer: ReturnType<typeof setTimeout> | undefined;
 let lsUnobservableResolve: (() => void) | undefined;
+// Restart commands that actually ran in the current cycle — the readiness probe
+// only observes the extensions whose restart command ran.
+let lastRestartRanCommands: string[] = [];
 
 /**
- * Readiness probe. Resolves 'ready' when the language server is Running again,
- * 'timeout' if it doesn't within the budget, or 'unobservable' if there's no API
- * to observe. Injectable via __test so integration tests can fake it (the
- * clangd extension isn't installed in the test host).
+ * Readiness probe. Resolves 'ready' when the observed language server(s) are
+ * Running again, 'timeout' if they don't within the budget, or 'unobservable' if
+ * there's nothing to observe (→ fixed time-gap fallback). Injectable via __test so
+ * integration tests can fake it without a live language server.
  */
-let lsReadyProbe: (timeoutMs: number) => Promise<LsReadiness> = clangdWaitForLsReady;
+let lsReadyProbe: (timeoutMs: number) => Promise<LsReadiness> = waitForLsReadyByConfig;
 
 function waitForLsReady(timeoutMs: number): Promise<LsReadiness> {
     return lsReadyProbe(timeoutMs);
 }
 
 /**
- * clangd-specific readiness probe: the extension/API lookup plus the
- * 'unobservable' path; the transition-aware waiting is delegated to the pure
- * `waitForClientReady`. `extensions.getExtension(id)?.exports` exposes
- * `getApi(1) -> { languageClient }`, a vscode-languageclient `LanguageClient`
- * with `.state` (State.Running === 2) and `.onDidChangeState`.
+ * Config-driven readiness probe. For each `restart command → extension id` entry
+ * in `worktree-continuity.languageServerReadinessExtensions` whose restart command
+ * actually ran this cycle and whose extension is installed, resolve a language
+ * client from the extension's exports (see extractLanguageClient) and wait for it
+ * to be Running again via the pure, transition-aware `waitForClientReady`.
  *
- * Version note (vscode-clangd 0.6.0): its `clangd.restart` handler disposes the
- * old client (fire-and-forget `stop()`) but `await`s creation of the NEW client
- * and repoints the exported `languageClient` at it before the command resolves —
- * so by the time we read it here the client is the fresh one, already Running,
- * with no further transition. The stale-Running race is therefore latent for
- * 0.6.0 (the graceMs branch resolves 'ready' for it), but live for any handler
- * that resolves the command while the SAME client is still winding down; the
- * transition-aware wait guards that case.
+ * Multiple observable clients → wait for ALL (Promise.all); any 'timeout' →
+ * 'timeout'; none observable (no entry, extension absent, or client not found) →
+ * 'unobservable', so the caller applies the fixed time-gap fallback.
  */
-async function clangdWaitForLsReady(timeoutMs: number): Promise<LsReadiness> {
-    try {
-        const ext = vscode.extensions.getExtension("llvm-vs-code-extensions.vscode-clangd");
-        if (!ext) {return "unobservable";}
-        const exports = ext.isActive ? ext.exports : await ext.activate();
-        const client = exports?.getApi?.(1)?.languageClient as ObservableClient | undefined;
-        if (!client) {return "unobservable";}
-        return await waitForClientReady(client, { timeoutMs, graceMs: LS_READY_GRACE_MS });
-    } catch (e) {
-        log(`LS readiness probe failed: ${e instanceof Error ? e.message : String(e)}`);
-        return "unobservable";
+async function waitForLsReadyByConfig(timeoutMs: number): Promise<LsReadiness> {
+    const map =
+        vscode.workspace
+            .getConfiguration()
+            .get<Record<string, string>>("worktree-continuity.languageServerReadinessExtensions", {}) ??
+        {};
+    const ran = new Set(lastRestartRanCommands);
+    const waits: Promise<"ready" | "timeout">[] = [];
+
+    for (const [command, extensionId] of Object.entries(map)) {
+        if (!ran.has(command)) {continue;} // its restart didn't run this cycle
+        try {
+            const ext = vscode.extensions.getExtension(extensionId);
+            if (!ext) {continue;} // not installed → ignore
+            const exports = ext.isActive ? ext.exports : await ext.activate();
+            const client = extractLanguageClient(exports);
+            if (!client) {
+                log(`LS readiness: no language client found on ${extensionId}; using time gap`);
+                continue;
+            }
+            waits.push(waitForClientReady(client, { timeoutMs, graceMs: LS_READY_GRACE_MS }));
+        } catch (e) {
+            log(`LS readiness probe failed for ${extensionId}: ${e instanceof Error ? e.message : String(e)}`);
+        }
     }
+
+    if (waits.length === 0) {return "unobservable";}
+    const results = await Promise.all(waits);
+    return results.some((r) => r === "timeout") ? "timeout" : "ready";
 }
 
 function delayUnobservableGap(ms: number): Promise<void> {
@@ -802,7 +817,9 @@ async function runLanguageServerRestartCycle(): Promise<void> {
     lsRestartInFlight = true;
     lsRestartPending = false;
     try {
-        await restartLanguageServers();
+        // Record which commands ran so the readiness probe observes only their
+        // extensions this cycle.
+        lastRestartRanCommands = await restartLanguageServers();
     } catch (e) {
         log(`LS restart cycle error: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -874,13 +891,15 @@ async function logLanguageServerScope(): Promise<void> {
     }
 }
 
-async function restartLanguageServers(): Promise<void> {
+/** Run the configured restart commands; returns the ones that actually ran. */
+async function restartLanguageServers(): Promise<string[]> {
     const commands = vscode.workspace
         .getConfiguration()
         .get<string[]>("worktree-continuity.languageServerRestartCommands", []);
-    if (!commands || commands.length === 0) {return;}
+    if (!commands || commands.length === 0) {return [];}
     await logLanguageServerScope();
     const available = new Set(await vscode.commands.getCommands(true));
+    const ran: string[] = [];
     for (const command of commands) {
         if (!available.has(command)) {
             log(`LS restart: command not present, skipping: ${command}`);
@@ -888,11 +907,13 @@ async function restartLanguageServers(): Promise<void> {
         }
         try {
             await vscode.commands.executeCommand(command);
+            ran.push(command);
             log(`LS restart: ran ${command}`);
         } catch (e) {
             log(`LS restart: ${command} failed: ${e instanceof Error ? e.message : String(e)}`);
         }
     }
+    return ran;
 }
 
 /**
@@ -1928,7 +1949,12 @@ export const __test = {
     },
     /** Inject a fake readiness probe; pass undefined to restore the real one. */
     setLsReadinessProbe(fn: ((timeoutMs: number) => Promise<LsReadiness>) | undefined): void {
-        lsReadyProbe = fn ?? clangdWaitForLsReady;
+        lsReadyProbe = fn ?? waitForLsReadyByConfig;
+    },
+    /** Call the real config-driven probe directly (bypassing any injected fake). */
+    probeLsReadinessViaConfig(ranCommands: string[], timeoutMs = 1000): Promise<LsReadiness> {
+        lastRestartRanCommands = ranCommands;
+        return waitForLsReadyByConfig(timeoutMs);
     },
     /** Toggle sibling-open interception (suites that need strays to persist turn it off). */
     setInterceptionEnabled(enabled: boolean): void {

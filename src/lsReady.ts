@@ -17,6 +17,61 @@ export interface ObservableClient {
     onDidChangeState?: (listener: (e: StateChange) => void) => { dispose(): void };
 }
 
+/** Whether a value looks like a vscode-languageclient `LanguageClient`. */
+function isLanguageClientLike(c: unknown): c is ObservableClient {
+    if (!c || typeof c !== "object") {
+        return false;
+    }
+    const r = c as Record<string, unknown>;
+    if (typeof r.state !== "number") {
+        return false;
+    }
+    // If it exposes onDidChangeState, it must be callable (else we can't observe).
+    if ("onDidChangeState" in r && typeof r.onDidChangeState !== "function") {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Extract a language client from a language-server extension's `exports`, trying
+ * the common shapes in order:
+ *   1. `exports.getApi(1).languageClient` (vscode-clangd)
+ *   2. `exports.languageClient`
+ *   3. `exports.client`
+ * Returns the first candidate that looks like a vscode-languageclient
+ * `LanguageClient` (numeric `.state`, and a callable `onDidChangeState` if it has
+ * one), or null if none qualify. Pure/vscode-free so it can be unit-tested.
+ */
+export function extractLanguageClient(exports: unknown): ObservableClient | null {
+    if (!exports || typeof exports !== "object") {
+        return null;
+    }
+    const e = exports as Record<string, unknown>;
+    const candidates: unknown[] = [];
+
+    const getApi = e.getApi;
+    if (typeof getApi === "function") {
+        try {
+            const api = (getApi as (version: number) => unknown).call(e, 1);
+            if (api && typeof api === "object") {
+                candidates.push((api as Record<string, unknown>).languageClient);
+            }
+        } catch {
+            // getApi may throw for an unsupported version; ignore and try others.
+        }
+    }
+    candidates.push(e.languageClient);
+    candidates.push(e.client);
+
+    for (const c of candidates) {
+        if (isLanguageClientLike(c)) {
+            return c;
+        }
+    }
+    return null;
+}
+
 export interface WaitOpts {
     /** Overall budget; resolves 'timeout' if readiness isn't reached in time. */
     timeoutMs: number;

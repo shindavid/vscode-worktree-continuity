@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+    extractLanguageClient,
     LS_STATE_RUNNING,
     waitForClientReady,
     type ObservableClient,
@@ -86,5 +87,64 @@ describe("waitForClientReady", () => {
             c.state = RUNNING;
         });
         await expect(p).resolves.toBe("ready");
+    });
+});
+
+describe("extractLanguageClient", () => {
+    const onDidChangeState = (): { dispose(): void } => ({ dispose: () => undefined });
+
+    it("extracts via getApi(1).languageClient (clangd shape)", () => {
+        const client = { state: RUNNING, onDidChangeState };
+        const exports = { getApi: (v: number) => (v === 1 ? { languageClient: client } : undefined) };
+        expect(extractLanguageClient(exports)).toBe(client);
+    });
+
+    it("extracts via exports.languageClient", () => {
+        const client = { state: RUNNING, onDidChangeState };
+        expect(extractLanguageClient({ languageClient: client })).toBe(client);
+    });
+
+    it("extracts via exports.client", () => {
+        const client = { state: RUNNING };
+        expect(extractLanguageClient({ client })).toBe(client);
+    });
+
+    it("prefers getApi over the other shapes", () => {
+        const apiClient = { state: RUNNING, onDidChangeState };
+        const other = { state: RUNNING };
+        const exports = {
+            getApi: () => ({ languageClient: apiClient }),
+            languageClient: other,
+            client: other,
+        };
+        expect(extractLanguageClient(exports)).toBe(apiClient);
+    });
+
+    it("returns null for junk exports", () => {
+        expect(extractLanguageClient(undefined)).toBeNull();
+        expect(extractLanguageClient(null)).toBeNull();
+        expect(extractLanguageClient(42)).toBeNull();
+        expect(extractLanguageClient({})).toBeNull();
+        expect(extractLanguageClient({ foo: "bar" })).toBeNull();
+    });
+
+    it("returns null when the candidate lacks a numeric state", () => {
+        expect(extractLanguageClient({ languageClient: { onDidChangeState } })).toBeNull();
+        expect(extractLanguageClient({ client: { state: "running" } })).toBeNull();
+    });
+
+    it("returns null when onDidChangeState is present but not callable", () => {
+        expect(extractLanguageClient({ client: { state: RUNNING, onDidChangeState: 5 } })).toBeNull();
+    });
+
+    it("ignores a throwing getApi and falls back to other shapes", () => {
+        const client = { state: RUNNING };
+        const exports = {
+            getApi: () => {
+                throw new Error("unsupported version");
+            },
+            client,
+        };
+        expect(extractLanguageClient(exports)).toBe(client);
     });
 });
