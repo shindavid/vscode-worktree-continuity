@@ -22,3 +22,4 @@ vsc-extension-quickstart.md
 *.vsix
 images/*.gif
 images/generate_icon.py
+demo.mp4
