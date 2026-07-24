@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { PositionCache, type PersistentStore } from "../src/positionCache";
 
-const KEY = "worktree-continuity.positions.v1";
+const KEY = "worktree-hot-swap.positions.v1";
 
 class FakeStore implements PersistentStore {
     data: Record<string, unknown> = {};

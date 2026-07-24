@@ -1,18 +1,18 @@
 {
-  "name": "vscode-worktree-continuity",
-  "displayName": "Worktree Continuity",
+  "name": "vscode-worktree-hot-swap",
+  "displayName": "Worktree Hot Swap",
   "description": "Switch between git worktrees in a single VS Code window without reloading, carrying your open editor tabs (with cursor/scroll position) over to the equivalent files in the target worktree. Designed for use with Claude Code.",
   "version": "0.1.0",
   "publisher": "shindavid",
   "license": "MIT",
   "icon": "images/icon.png",
-  "homepage": "https://github.com/shindavid/vscode-worktree-continuity#readme",
+  "homepage": "https://github.com/shindavid/vscode-worktree-hot-swap#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/shindavid/vscode-worktree-continuity.git"
+    "url": "https://github.com/shindavid/vscode-worktree-hot-swap.git"
   },
   "bugs": {
-    "url": "https://github.com/shindavid/vscode-worktree-continuity/issues"
+    "url": "https://github.com/shindavid/vscode-worktree-hot-swap/issues"
   },
   "keywords": [
     "git",
@@ -39,7 +39,7 @@
     "views": {
       "explorer": [
         {
-          "id": "worktreeContinuity.worktrees",
+          "id": "worktreeHotSwap.worktrees",
           "name": "Worktrees",
           "visibility": "visible"
         }
@@ -47,13 +47,13 @@
     },
     "viewsWelcome": [
       {
-        "view": "worktreeContinuity.worktrees",
-        "contents": "$(sync~spin) Loading worktrees…\n\nIf none appear, [Refresh](command:worktree-continuity.refreshView)."
+        "view": "worktreeHotSwap.worktrees",
+        "contents": "$(sync~spin) Loading worktrees…\n\nIf none appear, [Refresh](command:worktree-hot-swap.refreshView)."
       }
     ],
     "colors": [
       {
-        "id": "worktreeContinuity.currentWorktreeForeground",
+        "id": "worktreeHotSwap.currentWorktreeForeground",
         "description": "Foreground color of the current worktree in the Worktrees view.",
         "defaults": {
           "dark": "#89d185",
@@ -65,73 +65,73 @@
     ],
     "commands": [
       {
-        "command": "worktree-continuity.switchWorktree",
-        "title": "Worktree Continuity: Switch Worktree"
+        "command": "worktree-hot-swap.switchWorktree",
+        "title": "Worktree Hot Swap: Switch Worktree"
       },
       {
-        "command": "worktree-continuity.refreshView",
+        "command": "worktree-hot-swap.refreshView",
         "title": "Refresh Worktrees",
         "icon": "$(refresh)"
       },
       {
-        "command": "worktree-continuity.refreshWorktrees",
-        "title": "Worktree Continuity: Refresh Worktrees"
+        "command": "worktree-hot-swap.refreshWorktrees",
+        "title": "Worktree Hot Swap: Refresh Worktrees"
       },
       {
-        "command": "worktree-continuity.openTerminalInWorktree",
-        "title": "Worktree Continuity: Open Terminal in Worktree"
+        "command": "worktree-hot-swap.openTerminalInWorktree",
+        "title": "Worktree Hot Swap: Open Terminal in Worktree"
       },
       {
-        "command": "worktree-continuity.showLogs",
-        "title": "Worktree Continuity: Show Logs"
+        "command": "worktree-hot-swap.showLogs",
+        "title": "Worktree Hot Swap: Show Logs"
       },
       {
-        "command": "worktree-continuity.debugDump",
-        "title": "Worktree Continuity: Debug Dump (log state)"
+        "command": "worktree-hot-swap.debugDump",
+        "title": "Worktree Hot Swap: Debug Dump (log state)"
       },
       {
-        "command": "worktree-continuity.switchToWorktree",
+        "command": "worktree-hot-swap.switchToWorktree",
         "title": "Switch to Worktree"
       }
     ],
     "menus": {
       "commandPalette": [
         {
-          "command": "worktree-continuity.switchToWorktree",
+          "command": "worktree-hot-swap.switchToWorktree",
           "when": "false"
         },
         {
-          "command": "worktree-continuity.refreshView",
+          "command": "worktree-hot-swap.refreshView",
           "when": "false"
         }
       ],
       "view/title": [
         {
-          "command": "worktree-continuity.refreshView",
-          "when": "view == worktreeContinuity.worktrees",
+          "command": "worktree-hot-swap.refreshView",
+          "when": "view == worktreeHotSwap.worktrees",
           "group": "navigation"
         }
       ]
     },
     "configuration": {
-      "title": "Worktree Continuity",
+      "title": "Worktree Hot Swap",
       "properties": {
-        "worktree-continuity.carryTabs": {
+        "worktree-hot-swap.carryTabs": {
           "type": "boolean",
           "default": true,
           "description": "When switching worktrees, close tabs open against files in the old worktree and reopen the equivalent files in the new worktree, preserving cursor/scroll position and focus."
         },
-        "worktree-continuity.persistPositionsAcrossRestart": {
+        "worktree-hot-swap.persistPositionsAcrossRestart": {
           "type": "boolean",
           "default": true,
           "description": "Persist cached cursor/scroll positions in globalState so they survive VS Code restarts (not just in-session)."
         },
-        "worktree-continuity.anchorOnOpen": {
+        "worktree-hot-swap.anchorOnOpen": {
           "type": "boolean",
           "default": true,
           "description": "When a single git worktree is opened as the workspace, establish the anchor layout immediately on open (a one-time extension-host restart). This moves the unavoidable setup restart into the initial load, so the first worktree switch is instantaneous. Disable to defer setup until the first switch instead."
         },
-        "worktree-continuity.languageServerRestartCommands": {
+        "worktree-hot-swap.languageServerRestartCommands": {
           "type": "array",
           "items": {
             "type": "string"
@@ -145,7 +145,7 @@
           ],
           "markdownDescription": "Command IDs to run (debounced) to re-scope language servers to the active worktree after a switch or after reconciling stray tabs. Many language servers keep the previous worktree's index across a folder swap, so without this, Go to Definition can resolve a shared symbol (e.g. a function declared in a header) to the wrong worktree's copy.\n\nThe default covers common servers (clangd, Pylance, gopls, rust-analyzer, tsserver); **commands that aren't registered are skipped**, so only your installed servers are actually restarted. Add your own language server's restart command here if it isn't listed. Set to `[]` to disable. There is no VS Code API to enumerate language servers, so this list is necessarily curated."
         },
-        "worktree-continuity.languageServerReadinessExtensions": {
+        "worktree-hot-swap.languageServerReadinessExtensions": {
           "type": "object",
           "additionalProperties": {
             "type": "string"
@@ -153,7 +153,7 @@
           "default": {
             "clangd.restart": "llvm-vs-code-extensions.vscode-clangd"
           },
-          "markdownDescription": "Map of `restart command` → `extension id`. After running a restart command (from `#worktree-continuity.languageServerRestartCommands#`), the extension watches the named extension's exported language client to know when the server is Running again — so a rapid sequence of switches can fire an immediate coalesced follow-up restart instead of waiting a fixed ~6s gap.\n\nThe client is read from the extension's `exports` via `getApi(1).languageClient`, `languageClient`, or `client` (in that order). Commands **without** an entry here, extensions whose client can't be found, and entries for extensions that **aren't installed** simply fall back to the fixed time gap — nothing breaks.\n\n*clangd note:* vscode-clangd 0.6.0's `clangd.restart` handler awaits the new client's creation and repoints the exported `languageClient` before the command resolves, so the readiness observation sees the fresh client; the probe is transition-aware to handle other servers/versions that resolve their restart while the old client is still winding down."
+          "markdownDescription": "Map of `restart command` → `extension id`. After running a restart command (from `#worktree-hot-swap.languageServerRestartCommands#`), the extension watches the named extension's exported language client to know when the server is Running again — so a rapid sequence of switches can fire an immediate coalesced follow-up restart instead of waiting a fixed ~6s gap.\n\nThe client is read from the extension's `exports` via `getApi(1).languageClient`, `languageClient`, or `client` (in that order). Commands **without** an entry here, extensions whose client can't be found, and entries for extensions that **aren't installed** simply fall back to the fixed time gap — nothing breaks.\n\n*clangd note:* vscode-clangd 0.6.0's `clangd.restart` handler awaits the new client's creation and repoints the exported `languageClient` before the command resolves, so the readiness observation sees the fresh client; the probe is transition-aware to handle other servers/versions that resolve their restart while the old client is still winding down."
         }
       }
     }

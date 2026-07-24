@@ -4,7 +4,7 @@ import * as vscode from "vscode";
 import { __test } from "../extension";
 import { makeWorktreeFixture, type WorktreeFixture } from "./fixtures";
 
-const LS_CMD = "worktree-continuity.test.lsRestart";
+const LS_CMD = "worktree-hot-swap.test.lsRestart";
 
 async function waitUntil(pred: () => boolean, timeoutMs = 8000): Promise<void> {
     const start = Date.now();
@@ -46,7 +46,7 @@ suite("reconcile + language-server restart (integration)", () => {
         await vscode.workspace
             .getConfiguration()
             .update(
-                "worktree-continuity.languageServerRestartCommands",
+                "worktree-hot-swap.languageServerRestartCommands",
                 [LS_CMD],
                 vscode.ConfigurationTarget.Global
             );
@@ -58,7 +58,7 @@ suite("reconcile + language-server restart (integration)", () => {
         await vscode.workspace
             .getConfiguration()
             .update(
-                "worktree-continuity.languageServerRestartCommands",
+                "worktree-hot-swap.languageServerRestartCommands",
                 undefined,
                 vscode.ConfigurationTarget.Global
             );
@@ -221,7 +221,7 @@ suite("reconcile + language-server restart (integration)", () => {
 
     test("config-driven readiness: empty map (and absent extensions) → 'unobservable'", async () => {
         const cfg = vscode.workspace.getConfiguration();
-        const key = "worktree-continuity.languageServerReadinessExtensions";
+        const key = "worktree-hot-swap.languageServerReadinessExtensions";
         const original = cfg.get<Record<string, string>>(key);
         try {
             // Empty map: nothing to observe regardless of which commands ran → the

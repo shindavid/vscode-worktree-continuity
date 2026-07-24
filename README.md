@@ -1,4 +1,4 @@
-# Worktree Continuity
+# Worktree Hot Swap
 
 Switch between git worktrees seamlessly. Open file tabs automatically switch to
 their worktree versions and back based on your selection (tabs with unsaved changes are

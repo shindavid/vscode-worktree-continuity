@@ -50,11 +50,11 @@ let worktreeWatchers: vscode.FileSystemWatcher[] = [];
 let watchedCommonDirs = "";
 let watcherRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 
-const PRIMED_REPOS_KEY = "worktree-continuity.lastRepos.v1";
+const PRIMED_REPOS_KEY = "worktree-hot-swap.lastRepos.v1";
 // Persisted per-window so the next session can drive the first reconcile without
 // waiting for git discovery. Worktree map: globalState (shared, keyed by repo
 // common dir). Active worktree: workspaceState (this window's).
-const ACTIVE_WORKTREE_KEY = "worktree-continuity.activeWorktree.v1";
+const ACTIVE_WORKTREE_KEY = "worktree-hot-swap.activeWorktree.v1";
 
 function persistActiveWorktree(): void {
     if (!extensionContext) {return;}
@@ -141,7 +141,7 @@ function samePath(a: string, b: string): boolean {
 }
 
 const WARNINGS_DOC_URL =
-    "https://github.com/shindavid/vscode-worktree-continuity/blob/main/docs/warnings.md";
+    "https://github.com/shindavid/vscode-worktree-hot-swap/blob/main/docs/warnings.md";
 
 let mixedWarningShown = false;
 let mixedCheckTimer: ReturnType<typeof setTimeout> | undefined;
@@ -324,7 +324,7 @@ function scheduleMixedWorktreeCheck(): void {
         if (mixedWarningShown) {return;}
         mixedWarningShown = true;
         const choice = await vscode.window.showWarningMessage(
-            "Worktree Continuity: files from another worktree are open. This can confuse " +
+            "Worktree Hot Swap: files from another worktree are open. This can confuse " +
                 "language servers — e.g. Go to Definition may jump to the wrong worktree's copy.",
             "Reconcile",
             "Learn more"
@@ -375,7 +375,7 @@ function visibleTabPaths(): Set<string> {
 async function reconcileOpenTabs(repos: RepoSnapshot[]): Promise<number> {
     const carryTabs = vscode.workspace
         .getConfiguration()
-        .get<boolean>("worktree-continuity.carryTabs", true);
+        .get<boolean>("worktree-hot-swap.carryTabs", true);
     if (!carryTabs || !activeWorktreePath) {return 0;}
     const active = activeWorktreePath;
 
@@ -557,7 +557,7 @@ async function interceptSiblingOpen(doc: vscode.TextDocument): Promise<void> {
     const uriStr = doc.uri.toString();
     const carryTabs = vscode.workspace
         .getConfiguration()
-        .get<boolean>("worktree-continuity.carryTabs", true);
+        .get<boolean>("worktree-hot-swap.carryTabs", true);
     // Cheap, state-only pre-plan gate (pure). Notably: never intercept while a
     // switch is in flight or while the extension itself is opening tabs
     // (applyRemapDepth>0) — both invert or self-trigger the classification.
@@ -736,7 +736,7 @@ function waitForLsReady(timeoutMs: number): Promise<LsReadiness> {
 
 /**
  * Config-driven readiness probe. For each `restart command → extension id` entry
- * in `worktree-continuity.languageServerReadinessExtensions` whose restart command
+ * in `worktree-hot-swap.languageServerReadinessExtensions` whose restart command
  * actually ran this cycle and whose extension is installed, resolve a language
  * client from the extension's exports (see extractLanguageClient) and wait for it
  * to be Running again via the pure, transition-aware `waitForClientReady`.
@@ -749,7 +749,7 @@ async function waitForLsReadyByConfig(timeoutMs: number): Promise<LsReadiness> {
     const map =
         vscode.workspace
             .getConfiguration()
-            .get<Record<string, string>>("worktree-continuity.languageServerReadinessExtensions", {}) ??
+            .get<Record<string, string>>("worktree-hot-swap.languageServerReadinessExtensions", {}) ??
         {};
     const ran = new Set(lastRestartRanCommands);
     const waits: Promise<"ready" | "timeout">[] = [];
@@ -895,7 +895,7 @@ async function logLanguageServerScope(): Promise<void> {
 async function restartLanguageServers(): Promise<string[]> {
     const commands = vscode.workspace
         .getConfiguration()
-        .get<string[]>("worktree-continuity.languageServerRestartCommands", []);
+        .get<string[]>("worktree-hot-swap.languageServerRestartCommands", []);
     if (!commands || commands.length === 0) {return [];}
     await logLanguageServerScope();
     const available = new Set(await vscode.commands.getCommands(true));
@@ -942,17 +942,17 @@ function persistRepos(repos: RepoSnapshot[]): void {
 let outputChannel: vscode.OutputChannel | null = null;
 function log(msg: string): void {
     if (!outputChannel) {
-        outputChannel = vscode.window.createOutputChannel("Worktree Continuity");
+        outputChannel = vscode.window.createOutputChannel("Worktree Hot Swap");
     }
     const ts = new Date().toISOString().slice(11, 23);
     outputChannel.appendLine(`[${ts}] ${msg}`);
     // Mirror to the Debug Console so diagnostics survive even if the output
     // channel view is showing a stale instance.
-    console.log(`[worktree-continuity ${ts}] ${msg}`);
+    console.log(`[worktree-hot-swap ${ts}] ${msg}`);
 }
 
 export function activate(context: vscode.ExtensionContext) {
-    log("Worktree Continuity activating");
+    log("Worktree Hot Swap activating");
     extensionContext = context;
 
     // Register the tree view first, primed from persisted state, so it renders
@@ -968,7 +968,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     const persist = vscode.workspace
         .getConfiguration()
-        .get<boolean>("worktree-continuity.persistPositionsAcrossRestart", true);
+        .get<boolean>("worktree-hot-swap.persistPositionsAcrossRestart", true);
     positionCache = new PositionCache(persist ? context.globalState : undefined);
 
     const cmd = (name: string, fn: (...args: unknown[]) => Promise<void> | void) =>
@@ -979,21 +979,21 @@ export function activate(context: vscode.ExtensionContext) {
             } catch (e) {
                 const msg = e instanceof Error ? e.stack ?? e.message : String(e);
                 log(`Command ${name} threw: ${msg}`);
-                vscode.window.showErrorMessage(`Worktree Continuity: ${name} failed — see logs.`);
+                vscode.window.showErrorMessage(`Worktree Hot Swap: ${name} failed — see logs.`);
             }
         });
 
     context.subscriptions.push(
-        cmd("worktree-continuity.switchWorktree", () => switchWorktreeCommand()),
+        cmd("worktree-hot-swap.switchWorktree", () => switchWorktreeCommand()),
         cmd(SWITCH_TO_WORKTREE_COMMAND, (node) => switchToWorktreeCommand(node as WorktreeTreeNode)),
-        cmd("worktree-continuity.refreshWorktrees", () => refreshCommand()),
-        cmd("worktree-continuity.refreshView", () => refreshViewCommand()),
-        cmd("worktree-continuity.openTerminalInWorktree", () => openTerminalInWorktreeCommand()),
-        vscode.commands.registerCommand("worktree-continuity.showLogs", () => {
-            if (!outputChannel) {outputChannel = vscode.window.createOutputChannel("Worktree Continuity");}
+        cmd("worktree-hot-swap.refreshWorktrees", () => refreshCommand()),
+        cmd("worktree-hot-swap.refreshView", () => refreshViewCommand()),
+        cmd("worktree-hot-swap.openTerminalInWorktree", () => openTerminalInWorktreeCommand()),
+        vscode.commands.registerCommand("worktree-hot-swap.showLogs", () => {
+            if (!outputChannel) {outputChannel = vscode.window.createOutputChannel("Worktree Hot Swap");}
             outputChannel.show();
         }),
-        vscode.commands.registerCommand("worktree-continuity.debugDump", () => dumpDebugState("manual")),
+        vscode.commands.registerCommand("worktree-hot-swap.debugDump", () => dumpDebugState("manual")),
         vscode.workspace.onDidChangeWorkspaceFolders(async () => {
             log(`Workspace folders changed`);
             repoCache = null;
@@ -1505,7 +1505,7 @@ async function ensureAnchorDir(): Promise<string | null> {
             await vscode.workspace.fs.writeFile(
                 readme,
                 Buffer.from(
-                    "# Worktree Continuity anchor\n\n" +
+                    "# Worktree Hot Swap anchor\n\n" +
                         "This empty folder is pinned as the first workspace folder so that " +
                         "switching worktrees (which swaps the *second* folder) never restarts " +
                         "the extension host. You can ignore it.\n"
@@ -1530,7 +1530,7 @@ async function ensureAnchorDir(): Promise<string | null> {
 async function ensureAnchoredLayout(): Promise<boolean> {
     const enabled = vscode.workspace
         .getConfiguration()
-        .get<boolean>("worktree-continuity.anchorOnOpen", true);
+        .get<boolean>("worktree-hot-swap.anchorOnOpen", true);
     if (!enabled) {return false;}
 
     const folders = vscode.workspace.workspaceFolders ?? [];
@@ -1588,7 +1588,7 @@ async function performSwitch(repo: RepoSnapshot, worktree: Worktree): Promise<vo
 
     const anchor = await ensureAnchorDir();
     if (!anchor) {
-        vscode.window.showErrorMessage("Worktree Continuity: could not create the anchor folder.");
+        vscode.window.showErrorMessage("Worktree Hot Swap: could not create the anchor folder.");
         return;
     }
 
@@ -1596,7 +1596,7 @@ async function performSwitch(repo: RepoSnapshot, worktree: Worktree): Promise<vo
 
     const carryTabs = vscode.workspace
         .getConfiguration()
-        .get<boolean>("worktree-continuity.carryTabs", true);
+        .get<boolean>("worktree-hot-swap.carryTabs", true);
     const shouldCarry = carryTabs && !!oldRoot && oldRoot !== newRoot;
 
     log(

@@ -10,7 +10,7 @@ export interface PersistentStore {
     update(key: string, value: unknown): Thenable<void> | Promise<void>;
 }
 
-const STORAGE_KEY = "worktree-continuity.positions.v1";
+const STORAGE_KEY = "worktree-hot-swap.positions.v1";
 const FLUSH_DEBOUNCE_MS = 2000;
 
 /** commonDir -> relPath -> position */

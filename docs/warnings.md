@@ -16,7 +16,7 @@ looks like *one* symbol with two definitions. Go to Definition then can't tell
 which worktree you mean, and may pick the wrong one. Once it opens a file in the
 other worktree, that reinforces the confusion.
 
-**How Worktree Continuity avoids it:** it keeps a single worktree's files open at
+**How Worktree Hot Swap avoids it:** it keeps a single worktree's files open at
 a time — carrying tabs to the active worktree on switch, reconciling stray tabs
 on window open, and **intercepting a sibling-worktree file the moment it opens**
 (e.g. a Go to Definition that resolves into another worktree): it remaps the open
@@ -32,7 +32,7 @@ the one-click warning below appears.
 
 **How to fix it:** interception handles the common case automatically. If the
 warning does appear, click **Reconcile** — it remaps the stray tabs to the active
-worktree and restarts the language server. Or run **Worktree Continuity: Switch
+worktree and restarts the language server. Or run **Worktree Hot Swap: Switch
 Worktree** to any worktree and back, which closes other-worktree files as part of
 the switch. Manually, you can close the other-worktree tab(s) and then run
 **clangd: Restart language server**.

@@ -2,18 +2,18 @@ import * as vscode from "vscode";
 import type { Worktree } from "./git";
 import { worktreeLabel, type RepoSnapshot } from "./worktrees";
 
-export const WORKTREE_VIEW_ID = "worktreeContinuity.worktrees";
-export const SWITCH_TO_WORKTREE_COMMAND = "worktree-continuity.switchToWorktree";
+export const WORKTREE_VIEW_ID = "worktreeHotSwap.worktrees";
+export const SWITCH_TO_WORKTREE_COMMAND = "worktree-hot-swap.switchToWorktree";
 
 /** Theme color used to tint the current worktree (defined in package.json). */
-const CURRENT_COLOR_ID = "worktreeContinuity.currentWorktreeForeground";
+const CURRENT_COLOR_ID = "worktreeHotSwap.currentWorktreeForeground";
 
 /**
  * Custom URI scheme for the current worktree's tree item. Using a non-file
  * scheme scopes the green FileDecoration to our view only — a file:// URI would
  * also color the same folder in the file explorer.
  */
-const CURRENT_WORKTREE_SCHEME = "worktree-continuity";
+const CURRENT_WORKTREE_SCHEME = "worktree-hot-swap";
 
 /** Normalize a path for comparison (drop trailing separators). */
 function norm(p: string | null): string | null {

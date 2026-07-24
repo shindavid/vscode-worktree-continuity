@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate images/icon.png — the marketplace icon for Worktree Continuity.
+"""Generate images/icon.png — the marketplace icon for Worktree Hot Swap.
 
 A flat, two-tone geometric placeholder: a rounded dark tile with a git-worktree
 motif — a trunk that forks into two parallel branch lanes, with commit dots.
