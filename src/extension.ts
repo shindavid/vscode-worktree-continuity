@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { getGitCommonDir, getSuperprojectPath, listWorktrees, type Worktree } from "./git";
+import { guardSaysSkip, parseRestartGuard } from "./lsGuards";
 import { extractLanguageClient, waitForClientReady } from "./lsReady";
 import { PositionCache } from "./positionCache";
 import {
@@ -893,10 +894,13 @@ async function logLanguageServerScope(): Promise<void> {
 
 /** Run the configured restart commands; returns the ones that actually ran. */
 async function restartLanguageServers(): Promise<string[]> {
-    const commands = vscode.workspace
-        .getConfiguration()
-        .get<string[]>("worktree-hot-swap.languageServerRestartCommands", []);
+    const config = vscode.workspace.getConfiguration();
+    const commands = config.get<string[]>("worktree-hot-swap.languageServerRestartCommands", []);
     if (!commands || commands.length === 0) {return [];}
+    const guards = config.get<Record<string, unknown>>(
+        "worktree-hot-swap.languageServerRestartGuards",
+        {}
+    );
     await logLanguageServerScope();
     const available = new Set(await vscode.commands.getCommands(true));
     const ran: string[] = [];
@@ -904,6 +908,20 @@ async function restartLanguageServers(): Promise<string[]> {
         if (!available.has(command)) {
             log(`LS restart: command not present, skipping: ${command}`);
             continue;
+        }
+        // A registered command is not proof the server is on: some extensions
+        // (vscode-clangd, cpptools) keep their restart command registered while
+        // disabled and answer it with an enable-prompt or warning toast.
+        const guard = parseRestartGuard(guards?.[command]);
+        if (guard) {
+            const value = config.get(guard.setting);
+            if (guardSaysSkip(guard, value)) {
+                log(
+                    `LS restart: ${command} skipped, ${guard.setting} = ` +
+                        `${JSON.stringify(value)} (server disabled)`
+                );
+                continue;
+            }
         }
         try {
             await vscode.commands.executeCommand(command);

@@ -138,12 +138,65 @@
           },
           "default": [
             "clangd.restart",
+            "C_Cpp.RestartIntelliSenseForFile",
             "python.analysis.restartLanguageServer",
+            "basedpyright.restartserver",
             "go.languageserver.restart",
             "rust-analyzer.restartServer",
-            "typescript.restartTsServer"
+            "typescript.restartTsServer",
+            "deno.client.restart",
+            "java.server.restart",
+            "dotnet.restartServer",
+            "o.restart",
+            "rubyLsp.restart",
+            "dart.restartAnalysisServer",
+            "swift.restartLSPServer",
+            "jetbrains.kotlin.restartLsp",
+            "metals.restart-server",
+            "lua.startServer",
+            "vue.action.restartServer",
+            "vetur.restartVLS",
+            "svelte.restartLanguageServer",
+            "haskell.commands.restartServer",
+            "ocaml.server.restart",
+            "zig.zls.startRestart"
           ],
-          "markdownDescription": "Command IDs to run (debounced) to re-scope language servers to the active worktree after a switch or after reconciling stray tabs. Many language servers keep the previous worktree's index across a folder swap, so without this, Go to Definition can resolve a shared symbol (e.g. a function declared in a header) to the wrong worktree's copy.\n\nThe default covers common servers (clangd, Pylance, gopls, rust-analyzer, tsserver); **commands that aren't registered are skipped**, so only your installed servers are actually restarted. Add your own language server's restart command here if it isn't listed. Set to `[]` to disable. There is no VS Code API to enumerate language servers, so this list is necessarily curated."
+          "markdownDescription": "Command IDs to run (debounced) to re-scope language servers to the active worktree after a switch or after reconciling stray tabs. Many language servers keep the previous worktree's index across a folder swap, so without this, Go to Definition can resolve a shared symbol (e.g. a function declared in a header) to the wrong worktree's copy.\n\nThe default covers common servers for each major language, including alternates where a language has more than one popular server (e.g. clangd *and* cpptools, Pylance/Jedi *and* basedpyright, tsserver *and* Deno, Roslyn *and* OmniSharp, Vue *and* Vetur); **commands that aren't registered are skipped**, so only servers whose extension is actually running are restarted — unused entries cost nothing and never activate a dormant extension, and `#worktree-hot-swap.languageServerRestartGuards#` additionally skips servers that are installed but configured off. Add your own language server's restart command here if it isn't listed. Set to `[]` to disable. There is no VS Code API to enumerate language servers, so this list is necessarily curated."
+        },
+        "worktree-hot-swap.languageServerRestartGuards": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "setting",
+              "skipValues"
+            ],
+            "properties": {
+              "setting": {
+                "type": "string",
+                "description": "Full setting ID to inspect, e.g. clangd.enable."
+              },
+              "skipValues": {
+                "type": "array",
+                "description": "Skip the restart when the setting's current value equals any of these."
+              }
+            }
+          },
+          "default": {
+            "clangd.restart": {
+              "setting": "clangd.enable",
+              "skipValues": [false]
+            },
+            "C_Cpp.RestartIntelliSenseForFile": {
+              "setting": "C_Cpp.intelliSenseEngine",
+              "skipValues": ["disabled", "Disabled"]
+            },
+            "zig.zls.startRestart": {
+              "setting": "zig.zls.enabled",
+              "skipValues": ["off", "ask"]
+            }
+          },
+          "markdownDescription": "Map of `restart command` → guard. Before running a command from `#worktree-hot-swap.languageServerRestartCommands#`, if it has a guard here and the guarded setting's current value is one of `skipValues`, the restart is skipped.\n\nThis exists because a *registered* restart command is not proof the server is in use: some extensions keep the command registered while their server is configured off and answer it with UI or side effects — vscode-clangd with `clangd.enable: false` pops an \"enable clangd?\" prompt, cpptools with `C_Cpp.intelliSenseEngine: \"disabled\"` shows a warning toast, and Zig's `zig.zls.startRestart` force-writes `zig.zls.enabled: \"on\"` into user settings. The default guards cover all three, so a server you keep installed-but-disabled is never poked. (Edge case: if you run ZLS via an explicit `zig.zls.path` while `zig.zls.enabled` is not `\"on\"`, relax the Zig guard.)"
         },
         "worktree-hot-swap.languageServerReadinessExtensions": {
           "type": "object",
